@@ -691,7 +691,7 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
         client.get = AsyncMock(side_effect=get)
         with patch("twitter_telegram_bot.RSS_SOURCES", sources), \
              patch("twitter_telegram_bot.X_BEARER_TOKEN", ""), \
-             patch("twitter_telegram_bot.MIRROR_BREAKER_THRESHOLD", 2), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_SAMPLE", 2), \
              patch("twitter_telegram_bot.MIRROR_BREAKER_COOLDOWN", 10**9), \
              patch("twitter_telegram_bot.RSS_MERGE_GRACE", 0), \
              patch("twitter_telegram_bot.http", client):
@@ -719,7 +719,7 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
         client.get = AsyncMock(side_effect=get)
         with patch("twitter_telegram_bot.RSS_SOURCES", sources), \
              patch("twitter_telegram_bot.X_BEARER_TOKEN", ""), \
-             patch("twitter_telegram_bot.MIRROR_BREAKER_THRESHOLD", 1), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_SAMPLE", 1), \
              patch("twitter_telegram_bot.MIRROR_BREAKER_COOLDOWN", 10**9), \
              patch("twitter_telegram_bot.http", client):
             await fetch_feed("user")
@@ -741,27 +741,27 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_mirror_breaker_resets_on_success(self):
-        """Two hard failures bench a mirror; one success clears it again."""
-        with patch("twitter_telegram_bot.MIRROR_BREAKER_THRESHOLD", 2), \
+        """SAMPLE hard failures bench a mirror; one success clears it again."""
+        with patch("twitter_telegram_bot.MIRROR_BREAKER_SAMPLE", 2), \
              patch("twitter_telegram_bot.MIRROR_BREAKER_COOLDOWN", 10**9):
             host = "https://reset.example/{username}/rss"
             _mirror_mark_failure(host)
-            # Below threshold: the record tracks the failure but the mirror is NOT benched.
+            # Below sample: the record tracks the failure streak but the mirror is NOT benched.
             below = mirror_health["reset.example"]
             self.assertEqual(below["fails"], 1)
-            self.assertEqual(below["retry_after"], 0.0)
+            self.assertEqual(below["tripped_until"], 0.0)
             _mirror_mark_failure(host)
             record = mirror_health["reset.example"]
             self.assertEqual(record["fails"], 2)
-            self.assertGreater(record["retry_after"], 0)
+            self.assertGreater(record["tripped_until"], 0)
             _mirror_mark_success(host)
-            self.assertEqual(mirror_health["reset.example"], {"fails": 0, "retry_after": 0.0})
+            self.assertEqual(mirror_health["reset.example"], {"fails": 0, "tripped_until": 0.0})
 
     def test_dedicated_rsshub_is_exempt_from_breaker(self):
         """A configured dedicated RSSHub instance is never benched."""
         with patch("twitter_telegram_bot.RSSHUB_BASE_URL", "http://rsshub.internal:1200"), \
              patch("twitter_telegram_bot.PUBLIC_RSSHUB_BASE_URL", "https://rsshub.app"), \
-             patch("twitter_telegram_bot.MIRROR_BREAKER_THRESHOLD", 1), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_SAMPLE", 1), \
              patch("twitter_telegram_bot.MIRROR_BREAKER_COOLDOWN", 10**9):
             _mirror_mark_failure("http://rsshub.internal:1200/twitter/user/{username}")
             _mirror_mark_failure("https://public.example/rss")

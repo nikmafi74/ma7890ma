@@ -71,12 +71,13 @@ RSS_FETCH_TIMEOUT = _env_float("RSS_FETCH_TIMEOUT", 12, minimum=1.0)
 RSS_MERGE_GRACE = _env_float("RSS_MERGE_GRACE", 0.25, minimum=0.0)
 # Circuit breaker for feed mirrors: most public mirrors are permanently dead
 # (DNS gone, HTTP 403/410/451). Every tracked account used to hit every dead
-# mirror on every check. After N consecutive hard failures a mirror is benched
-# for a cooldown, cutting ~85% of feed traffic with no behavior change; the
-# benched mirrors are also re-probed periodically in case they come back.
-MIRROR_BREAKER_THRESHOLD = _env_int("MIRROR_BREAKER_THRESHOLD", 3, minimum=1)
+# mirror on every check. A mirror is benched after N CONSECUTIVE hard failures
+# — N must be large enough (≫ accounts probed in one round) that a mirror
+# which serves most accounts is not benched on a bad streak for a few of them
+# — for a cooldown, then re-probed in case it came back.
+MIRROR_BREAKER_SAMPLE = _env_int("MIRROR_BREAKER_SAMPLE", 12, minimum=2)
 MIRROR_BREAKER_COOLDOWN = _env_int("MIRROR_BREAKER_COOLDOWN", 1800, minimum=60)
-mirror_health = {}  # host -> {"fails": int, "retry_after": monotonic ts}]
+mirror_health = {}  # host -> {"fails": int, "tripped_until": monotonic ts}]
 
 PLACEHOLDER_API_KEYS = {"key", "your_key", "your_api_key", "your_gemini_api_key", "your_requesty_or_gemini_key"}
 
@@ -153,9 +154,31 @@ class _TelegramTokenRedactionFilter(logging.Filter):
         return True
 
 
+class _ConflictHintFilter(logging.Filter):
+    """"terminated by other getUpdates" errors sound cryptic; append the exact cure."""
+
+    _hint = (
+        " | FIX: another bot instance is polling this token — stop the duplicate "
+        "(a previous Railway deployment still draining, a second Railway service/replica, "
+        "or a local `python twitter_telegram_bot.py`); the error stops once that instance quits."
+    )
+
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if "terminated by other getUpdates" in message and self._hint not in message:
+            record.msg = message + self._hint
+            record.args = ()
+        return True
+
+
 _token_redaction_filter = _TelegramTokenRedactionFilter()
+_conflict_hint_filter = _ConflictHintFilter()
 for _handler in logging.getLogger().handlers:
     _handler.addFilter(_token_redaction_filter)
+    _handler.addFilter(_conflict_hint_filter)
 
 # httpx/httpcore log every request and protocol event at INFO/DEBUG; python-
 # telegram's DEBUG logs can also include full message text and chat IDs. Keep
@@ -925,17 +948,17 @@ def _mirror_is_exempt(source):
 
 
 def _mirror_mark_success(source):
-    mirror_health[_mirror_host(source)] = {"fails": 0, "retry_after": 0.0}
+    mirror_health[_mirror_host(source)] = {"fails": 0, "tripped_until": 0.0}
 
 
 def _mirror_mark_failure(source):
     host = _mirror_host(source)
     if not host or _mirror_is_exempt(source):
         return
-    record = mirror_health.setdefault(host, {"fails": 0, "retry_after": 0.0})
+    record = mirror_health.setdefault(host, {"fails": 0, "tripped_until": 0.0})
     record["fails"] += 1
-    if record["fails"] >= MIRROR_BREAKER_THRESHOLD:
-        record["retry_after"] = time.monotonic() + MIRROR_BREAKER_COOLDOWN
+    if record["fails"] >= MIRROR_BREAKER_SAMPLE:
+        record["tripped_until"] = time.monotonic() + MIRROR_BREAKER_COOLDOWN
         logger.info(
             "Mirror %s benched for %ss after %s consecutive failures",
             host,
@@ -952,8 +975,8 @@ def _mirror_stats():
         1
         for source in RSS_SOURCES
         if (record := mirror_health.get(_mirror_host(source)))
-        and record["fails"] >= MIRROR_BREAKER_THRESHOLD
-        and now < record["retry_after"]
+        and record["fails"] >= MIRROR_BREAKER_SAMPLE
+        and now < record["tripped_until"]
     )
     return total, benched
 
@@ -971,17 +994,18 @@ async def fetch_feed(username):
         logger.warning("Falling back to public RSS mirrors for @%s", target_username)
 
     all_sources = list(RSS_SOURCES)
+    now_mono = time.monotonic()
     sources = [
         src
         for src in all_sources
         if (record := mirror_health.get(_mirror_host(src))) is None
-        or record["fails"] < MIRROR_BREAKER_THRESHOLD
-        or time.monotonic() >= record["retry_after"]
+        or record["fails"] < MIRROR_BREAKER_SAMPLE
+        or now_mono >= record["tripped_until"]
     ]
     if not sources and all_sources:
         # The breaker must never blind the bot completely: when every mirror is
         # benched, still probe the one whose cooldown expires soonest.
-        soonest_host = min(mirror_health, key=lambda host: mirror_health[host]["retry_after"])
+        soonest_host = min(mirror_health, key=lambda host: mirror_health[host]["tripped_until"])
         sources = [src for src in all_sources if _mirror_host(src) == soonest_host][:1]
         logger.info("All mirrors are in reset cooldown; probing the soonest: %s", soonest_host)
     skipped = len(all_sources) - len(sources)
