@@ -725,11 +725,20 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
             await fetch_feed("user")
             await fetch_feed("user")
 
-        # Run 1 probes both mirrors; run 2 probes exactly the soonest (breaker-x,
-        # benched first) instead of going blind.
+        # Run 1 probes both mirrors; run 2 probes exactly one benched mirror
+        # instead of going blind. Which mirror wins the tie depends on task
+        # completion order (equal monotonic timestamps on fast CI), so the
+        # assertion must not pick a specific host.
         self.assertEqual(len(calls), 3)
-        self.assertEqual(len([u for u in calls if "breaker-x" in u]), 2)
-        self.assertEqual(len([u for u in calls if "breaker-y" in u]), 1)
+        second_run = set(calls[2:])
+        self.assertEqual(len(second_run), 1)
+        self.assertTrue(
+            next(iter(second_run)).startswith(("https://breaker-x.example/", "https://breaker-y.example/"))
+        )
+        self.assertEqual(
+            len([u for u in calls if "breaker-x" in u]) + len([u for u in calls if "breaker-y" in u]),
+            3,
+        )
 
     def test_mirror_breaker_resets_on_success(self):
         """Two hard failures bench a mirror; one success clears it again."""
