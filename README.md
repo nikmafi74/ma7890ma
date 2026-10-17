@@ -141,6 +141,7 @@ curl "https://<your-rsshub-domain>/twitter/user/nasa?key=<ACCESS_KEY>"
 | Instance is up but timelines are empty | X often blocks datacenter IPs — set `PROXY_URI` (e.g. `http://user:pass@host:port` or `socks5h://host:port`) on the RSSHub service, or route via `TWITTER_THIRD_PARTY_API` |
 | Wrong `ACCESS_KEY` on the bot side | Requests fail with HTTP 403 — the bot logs it and falls back to public mirrors until fixed |
 | Instance briefly down | Nothing to do — the bot automatically falls back to public RSS mirrors and resumes your instance when it answers |
+| Log shows `Conflict: terminated by other getUpdates` | Two bot instances poll the same token — stop the duplicate: a previous Railway deployment still draining, a second Railway service/replica of this repo, or a local `python twitter_telegram_bot.py` that is still open |
 
 > ⚠️ Reading X through an account cookie is against X's ToS; use a throwaway account you can afford to lose.
 

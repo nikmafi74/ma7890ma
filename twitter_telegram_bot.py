@@ -165,11 +165,16 @@ class _ConflictHintFilter(logging.Filter):
 
     def filter(self, record):
         try:
-            message = record.getMessage()
+            haystack = record.getMessage()
         except Exception:
-            return True
-        if "terminated by other getUpdates" in message and self._hint not in message:
-            record.msg = message + self._hint
+            haystack = ""
+        # python-telegram logs the polling failure as a short message ("Exception
+        # happened while polling for updates.") with the Conflict in exc_info's
+        # traceback, so the hint must look there too.
+        if record.exc_info and record.exc_info[1] is not None:
+            haystack += "\n" + str(record.exc_info[1])
+        if "terminated by other getUpdates" in haystack and self._hint not in record.getMessage():
+            record.msg = record.getMessage() + self._hint
             record.args = ()
         return True
 

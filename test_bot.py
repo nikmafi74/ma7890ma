@@ -1,5 +1,6 @@
 import asyncio
 import html
+import logging
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,6 +9,7 @@ from twitter_telegram_bot import (
     TELEGRAM_TEXT_LIMIT,
     RSS_SOURCES,
     PUBLIC_RSSHUB_BASE_URL,
+    _ConflictHintFilter,
     _mirror_mark_failure,
     _mirror_mark_success,
     mirror_health,
@@ -662,6 +664,31 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
 
         # Bot must NEVER be called during backfill
         self.assertEqual(bot.send_message.call_count, 0)
+
+    def test_conflict_hint_filter_appends_fix_to_exc_info(self):
+        """The polling Conflict rides in exc_info, not in the log message — the
+        filter must catch it there and append the exact fix."""
+        from telegram.error import Conflict
+
+        filter_ = _ConflictHintFilter()
+        record = logging.LogRecord(
+            "telegram.ext._updater",
+            logging.ERROR,
+            __file__,
+            1,
+            "Exception happened while polling for updates.",
+            (),
+            None,
+        )
+        record.exc_info = (Conflict, Conflict("terminated by other getUpdates request"), None)
+
+        self.assertTrue(filter_.filter(record))
+        self.assertIn("FIX: another bot instance is polling this token", record.getMessage())
+
+        # A non-conflict record must pass through untouched.
+        plain = logging.LogRecord("x", logging.ERROR, __file__, 1, "ordinary failure", (), None)
+        self.assertTrue(filter_.filter(plain))
+        self.assertNotIn("FIX:", plain.getMessage())
 
     def _item(self, tweet_id, title="hello post"):
         return (
