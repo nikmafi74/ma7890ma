@@ -250,6 +250,7 @@ twitter-telegram-bot/
 | `RSS_MERGE_GRACE` | `0.25` | Extra seconds to merge fast mirror responses after the first usable feed |
 | `MIRROR_BREAKER_SAMPLE` | `12` | Consecutive failures across accounts that bench a dead public mirror (circuit breaker) — cuts wasted feed requests; sized ≫ accounts-per-round so a mirror serving most accounts is never benched on a short bad streak |
 | `MIRROR_BREAKER_COOLDOWN` | `1800` | How long a benched mirror stays out of rotation (seconds); your dedicated RSSHub instance is never benched |
+| `MIRROR_RATE_LIMIT_COOLDOWN` | `120` | Backoff after HTTP 429 (rate limited). A throttled mirror is *alive*, so it gets this short pause instead of the 30-minute bench and does not count toward the failure sample |
 | `CHECK_INTERVAL` | `300` | Check interval (seconds) |
 | `TRANSLATE_FA` | `true` | Enable Persian translation |
 | `REQUESTY_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY` | empty | AI provider key for higher quality translation |

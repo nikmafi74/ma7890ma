@@ -77,7 +77,14 @@ RSS_MERGE_GRACE = _env_float("RSS_MERGE_GRACE", 0.25, minimum=0.0)
 # — for a cooldown, then re-probed in case it came back.
 MIRROR_BREAKER_SAMPLE = _env_int("MIRROR_BREAKER_SAMPLE", 12, minimum=2)
 MIRROR_BREAKER_COOLDOWN = _env_int("MIRROR_BREAKER_COOLDOWN", 1800, minimum=60)
-mirror_health = {}  # host -> {"fails": int, "tripped_until": monotonic ts}]
+# HTTP 429 means "alive but throttled", NOT dead. Back such a mirror off briefly
+# without feeding the death counter, so a mirror we merely rate-limited ourselves
+# is never benched for half an hour and our own bursts stop making it worse.
+MIRROR_RATE_LIMIT_COOLDOWN = _env_int("MIRROR_RATE_LIMIT_COOLDOWN", 120, minimum=10)
+mirror_health = {}  # host -> {"fails": int, "tripped_until": monotonic ts}
+# Sentinel returned by _try_feed_instance on HTTP 429 so fetch_feed can tell
+# "throttled" apart from "dead".
+_RATE_LIMITED = object()
 
 PLACEHOLDER_API_KEYS = {"key", "your_key", "your_api_key", "your_gemini_api_key", "your_requesty_or_gemini_key"}
 
@@ -761,6 +768,9 @@ async def _try_feed_instance(url, target_username):
     try:
         async with rss_fetch_sem:
             resp = await http.get(url, timeout=12, follow_redirects=True)
+        if resp.status_code == 429:
+            logger.debug("Feed %s -> %s returned HTTP 429 (rate limited)", url, resp.url)
+            return _RATE_LIMITED
         if resp.status_code != 200:
             logger.debug("Feed %s -> %s returned HTTP %s", url, resp.url, resp.status_code)
             return None
@@ -972,18 +982,42 @@ def _mirror_mark_failure(source):
         )
 
 
+def _mirror_mark_rate_limited(source):
+    """HTTP 429: the mirror is alive but asking us to back off.
+
+    The cooldown is short and the death counter is left untouched, so a mirror
+    we merely throttled ourselves is never benched as dead for half an hour.
+    """
+    host = _mirror_host(source)
+    if not host or _mirror_is_exempt(source):
+        return
+    record = mirror_health.setdefault(host, {"fails": 0, "tripped_until": 0.0})
+    until = time.monotonic() + MIRROR_RATE_LIMIT_COOLDOWN
+    if until > record["tripped_until"]:
+        record["tripped_until"] = until
+    logger.debug(
+        "Mirror %s rate-limited (HTTP 429); backing off %ss (death counter stays at %s)",
+        host,
+        MIRROR_RATE_LIMIT_COOLDOWN,
+        record["fails"],
+    )
+
+
 def _mirror_stats():
-    """(total sources, benched sources) for /status and /healthz."""
+    """(total sources, currently-skipped sources) for /status and /healthz.
+
+    Counts every mirror in cooldown, whether benched as dead or merely
+    rate-limited — both mean "not being probed right now".
+    """
     now = time.monotonic()
     total = len(RSS_SOURCES)
-    benched = sum(
+    unavailable = sum(
         1
         for source in RSS_SOURCES
         if (record := mirror_health.get(_mirror_host(source)))
-        and record["fails"] >= MIRROR_BREAKER_SAMPLE
         and now < record["tripped_until"]
     )
-    return total, benched
+    return total, unavailable
 
 
 async def fetch_feed(username):
@@ -1000,11 +1034,14 @@ async def fetch_feed(username):
 
     all_sources = list(RSS_SOURCES)
     now_mono = time.monotonic()
+    # tripped_until alone governs: it stays at 0 until either the death counter
+    # reaches the sample or a rate limit arms a (short) cooldown, and expires for
+    # both. The old `fails < SAMPLE` clause was redundant — and it would have
+    # cancelled a rate-limit cooldown for any mirror not yet benched.
     sources = [
         src
         for src in all_sources
         if (record := mirror_health.get(_mirror_host(src))) is None
-        or record["fails"] < MIRROR_BREAKER_SAMPLE
         or now_mono >= record["tripped_until"]
     ]
     if not sources and all_sources:
@@ -1064,6 +1101,9 @@ async def fetch_feed(username):
                         exc,
                     )
                     _mirror_mark_failure(source)
+                    continue
+                if result is _RATE_LIMITED:
+                    _mirror_mark_rate_limited(source)
                     continue
                 if result is None:
                     _mirror_mark_failure(source)

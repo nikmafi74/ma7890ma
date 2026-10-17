@@ -767,6 +767,63 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
             3,
         )
 
+    async def test_rate_limit_backs_off_without_benching(self):
+        """HTTP 429 arms a short cooldown but never advances the death counter —
+        a throttled mirror must not be benched as dead for half an hour."""
+        rss = self._rss(self._item("2111000000000000001"))
+        calls = []
+
+        async def get(url, **_kwargs):
+            calls.append(url)
+            if "limited.example" in url:
+                return MagicMock(status_code=429, url=url)
+            return MagicMock(status_code=200, text=rss, url=url)
+
+        sources = [
+            "https://limited.example/{username}/rss",
+            "https://healthy.example/{username}/rss",
+        ]
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=get)
+        with patch("twitter_telegram_bot.RSS_SOURCES", sources), \
+             patch("twitter_telegram_bot.X_BEARER_TOKEN", ""), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_SAMPLE", 2), \
+             patch("twitter_telegram_bot.MIRROR_RATE_LIMIT_COOLDOWN", 10**9), \
+             patch("twitter_telegram_bot.RSS_MERGE_GRACE", 0), \
+             patch("twitter_telegram_bot.http", client):
+            await fetch_feed("user")   # cycle 1: 429 recorded, cooldown armed
+            await fetch_feed("user")   # cycle 2: throttled host must be skipped
+
+        # Cycle 1 probed both hosts; cycle 2 skipped only the throttled one.
+        self.assertEqual(len([u for u in calls if "limited.example" in u]), 1)
+        self.assertEqual(len([u for u in calls if "healthy.example" in u]), 2)
+        # The death counter is untouched by a 429 (SAMPLE is 2, so a 429 counted
+        # as a failure would have benched it here).
+        self.assertEqual(mirror_health["limited.example"]["fails"], 0)
+        self.assertGreater(mirror_health["limited.example"]["tripped_until"], 0)
+        self.assertEqual(mirror_health["healthy.example"], {"fails": 0, "tripped_until": 0.0})
+
+    async def test_rate_limited_mirror_is_reprobed_after_cooldown(self):
+        """A short 429 cooldown expires and the mirror becomes eligible again."""
+        calls = []
+
+        async def get(url, **_kwargs):
+            calls.append(url)
+            return MagicMock(status_code=429, url=url)
+
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=get)
+        with patch("twitter_telegram_bot.RSS_SOURCES", ["https://back.example/{username}/rss"]), \
+             patch("twitter_telegram_bot.X_BEARER_TOKEN", ""), \
+             patch("twitter_telegram_bot.MIRROR_RATE_LIMIT_COOLDOWN", 0.05), \
+             patch("twitter_telegram_bot.http", client):
+            await fetch_feed("user")
+            self.assertEqual(len(calls), 1)
+            await asyncio.sleep(0.1)
+            await fetch_feed("user")
+
+        self.assertEqual(len(calls), 2)
+
     def test_mirror_breaker_resets_on_success(self):
         """SAMPLE hard failures bench a mirror; one success clears it again."""
         with patch("twitter_telegram_bot.MIRROR_BREAKER_SAMPLE", 2), \
