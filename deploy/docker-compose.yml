@@ -1,0 +1,100 @@
+# Full private stack: dedicated RSSHub (+ Redis cache) + PostgreSQL + this bot.
+#
+#   1. cp deploy/.env.example deploy/.env   and fill it in
+#   2. docker compose -f deploy/docker-compose.yml up -d --build
+#
+# The bot needs NO X API Bearer Token: RSSHub's /twitter/user route reads
+# timelines with a logged-in X account cookie (TWITTER_AUTH_TOKEN).
+name: x-telegram-bot
+
+services:
+  # ── Dedicated RSSHub ────────────────────────────────────────────────────
+  rsshub:
+    # Matches the upstream DIYgod/RSSHub compose file. The Twitter route needs
+    # no Chromium/Playwright, so the plain image is enough.
+    image: diygod/rsshub
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      CACHE_TYPE: redis
+      REDIS_URL: redis://redis:6379/
+      # Cookie `auth_token` of a logged-in X account — NOT an X API Bearer
+      # Token. Several accounts can be given, comma-separated, for rotation.
+      TWITTER_AUTH_TOKEN: ${TWITTER_AUTH_TOKEN:?set TWITTER_AUTH_TOKEN in deploy/.env}
+      # Shared secret with the bot; empty disables protection (not recommended
+      # for an internet-facing instance).
+      ACCESS_KEY: ${RSSHUB_ACCESS_KEY:-}
+      # X often blocks datacenter IPs. If feeds come back empty, point RSSHub
+      # through a proxy, e.g. http://user:pass@host:port or socks5h://host:port
+      PROXY_URI: ${RSSHUB_PROXY_URI:-}
+      # Optional: route X GraphQL calls through a third-party API mirror
+      # TWITTER_THIRD_PARTY_API: ${TWITTER_THIRD_PARTY_API:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1200/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 5s
+
+  # ── Database for the bot ────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      POSTGRES_DB: tweets
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d tweets"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── This bot ────────────────────────────────────────────────────────────
+  bot:
+    build:
+      context: ..
+      dockerfile: deploy/bot.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rsshub:
+        condition: service_healthy
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in deploy/.env}
+      DATABASE_URL: postgresql://bot:${POSTGRES_PASSWORD}@postgres:5432/tweets
+      # Private RSSHub over the compose network; http (not https) is correct here.
+      RSSHUB_BASE_URL: http://rsshub:1200
+      RSSHUB_ACCESS_KEY: ${RSSHUB_ACCESS_KEY:-}
+      # Translation (optional)
+      TRANSLATE_FA: ${TRANSLATE_FA:-true}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      REQUESTY_API_KEY: ${REQUESTY_API_KEY:-}
+      REQUESTY_MODEL: ${REQUESTY_MODEL:-}
+      CHECK_INTERVAL: ${CHECK_INTERVAL:-300}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PORT: "8080"
+    ports:
+      # Live web dashboard: http://<host>:8080
+      - "${DASHBOARD_PORT:-8080}:8080"
+
+volumes:
+  redis-data:
+  pgdata:
