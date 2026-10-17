@@ -51,8 +51,6 @@ DATABASE_URL=آدرس PostgreSQL
 # RSSHUB_BASE_URL=https://rsshub.app
 # اختیاری: اگر روی RSSHub خودت متغیر ACCESS_KEY گذاشتی، همین مقدار را اینجا هم بگذار
 # RSSHUB_ACCESS_KEY=
-ADMIN_CHAT_ID=چت آیدی خودت (اختیاری)
-
 # ترجمه فارسی (اختیاری)
 TRANSLATE_FA=true
 # می‌تونی REQUESTY_API_KEY یا GEMINI_API_KEY استفاده کنی
@@ -218,7 +216,6 @@ curl "https://<آدرس-rsshub>/twitter/user/nasa?key=<ACCESS_KEY>"
 twitter-telegram-bot/
 ├── twitter_telegram_bot.py   # ربات اصلی + وب سرور
 ├── database.py               # مدیریت PostgreSQL
-├── web_server.py             # سرور وب (اختیاری)
 ├── templates/index.html      # قالب داشبورد وب
 ├── sw.js                     # Service Worker
 ├── manifest.json             # PWA Manifest

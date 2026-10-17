@@ -1,8 +1,10 @@
 .env
+deploy/.env
 __pycache__/
 *.pyc
 *.pyo
 .DS_Store
 *.db
+*.log
 venv/
 .venv/

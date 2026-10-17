@@ -1,37 +1,74 @@
-import os, asyncio, logging, feedparser, re, httpx, html, hashlib, time
+import os, asyncio, logging, feedparser, re, httpx, html, hashlib, time, sys
 from urllib.parse import quote
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, WebAppInfo,
+    ReplyKeyboardMarkup, KeyboardButton,
     InlineQueryResultArticle, InputTextMessageContent, InputFile,
 )
-from telegram.ext import Application, CommandHandler, InlineQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, InlineQueryHandler
 from telegram.constants import ParseMode
 from database import Database
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 import uvicorn
 
 load_dotenv()
 
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+
+def _env_value(key, fallback):
+    value = os.getenv(key)
+    if value is None:
+        return fallback
+    value = value.strip()
+    # An empty variable (easy to create in a Railway UI) is "unset", not "0".
+    return value if value else fallback
+
+
+def _env_int(key, fallback, minimum=None):
+    """Parse an integer env var without crashing boot on a typo/empty value."""
+    try:
+        value = int(_env_value(key, str(fallback)))
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning("%s=%r is not a valid integer; using %s", key, os.getenv(key), fallback)
+        value = fallback
+    return max(minimum, value) if minimum is not None else value
+
+
+def _env_float(key, fallback, minimum=None):
+    try:
+        value = float(_env_value(key, str(fallback)))
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning("%s=%r is not a valid number; using %s", key, os.getenv(key), fallback)
+        value = fallback
+    return max(minimum, value) if minimum is not None else value
+
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+if not TOKEN:
+    # Fail loudly and cleanly: continuing would crash deep inside telegram polling
+    # with a stack trace that hides the actual missing-variable problem.
+    logging.getLogger(__name__).critical(
+        "TELEGRAM_BOT_TOKEN is not set! Get one from @BotFather and set it as an environment variable."
+    )
+    sys.exit(1)
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
-X_API_BASE_URL = (os.getenv("X_API_BASE_URL") or "https://api.x.com/2").strip().rstrip("/")
-X_USER_ID_CACHE_TTL = max(60, int(os.getenv("X_USER_ID_CACHE_TTL", "86400")))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
-CONCURRENT_LIMIT = int(os.getenv("CONCURRENT_LIMIT", "3"))
-HTTP_MAX_CONNECTIONS = max(50, int(os.getenv("HTTP_MAX_CONNECTIONS", "50")))
+X_API_BASE_URL = _env_value("X_API_BASE_URL", "https://api.x.com/2").rstrip("/")
+X_USER_ID_CACHE_TTL = _env_int("X_USER_ID_CACHE_TTL", 86400, minimum=60)
+CHECK_INTERVAL = _env_int("CHECK_INTERVAL", 300, minimum=30)
+CONCURRENT_LIMIT = _env_int("CONCURRENT_LIMIT", 3, minimum=1)
+HTTP_MAX_CONNECTIONS = max(50, _env_int("HTTP_MAX_CONNECTIONS", 50, minimum=50))
 # Each tracked account fans out to several RSS mirrors; cap requests globally so
 # concurrent accounts cannot exhaust httpx's connection pool and raise PoolTimeout.
-RSS_FETCH_CONCURRENCY = max(1, int(os.getenv("RSS_FETCH_CONCURRENCY", "12")))
+RSS_FETCH_CONCURRENCY = _env_int("RSS_FETCH_CONCURRENCY", 12, minimum=1)
 # Bound every account's mirror sweep and only wait briefly to merge other fast replies.
-RSS_FETCH_TIMEOUT = max(1.0, float(os.getenv("RSS_FETCH_TIMEOUT", "12")))
-RSS_MERGE_GRACE = max(0.0, float(os.getenv("RSS_MERGE_GRACE", "0.25")))
+RSS_FETCH_TIMEOUT = _env_float("RSS_FETCH_TIMEOUT", 12, minimum=1.0)
+RSS_MERGE_GRACE = _env_float("RSS_MERGE_GRACE", 0.25, minimum=0.0)
 
 PLACEHOLDER_API_KEYS = {"key", "your_key", "your_api_key", "your_gemini_api_key", "your_requesty_or_gemini_key"}
 
@@ -43,14 +80,18 @@ GEMINI_API_KEY = _clean_api_key(os.getenv("GEMINI_API_KEY"))
 OPENAI_API_KEY = _clean_api_key(os.getenv("OPENAI_API_KEY"))
 REQUESTY_API_KEY = _clean_api_key(os.getenv("REQUESTY_API_KEY")) or GEMINI_API_KEY or OPENAI_API_KEY
 
+# Never send an API key to a host the user did not explicitly configure.
 if os.getenv("REQUESTY_BASE_URL"):
     REQUESTY_BASE_URL = os.getenv("REQUESTY_BASE_URL", "").strip().rstrip("/")
 elif GEMINI_API_KEY and REQUESTY_API_KEY == GEMINI_API_KEY:
     REQUESTY_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 elif OPENAI_API_KEY and REQUESTY_API_KEY == OPENAI_API_KEY:
     REQUESTY_BASE_URL = "https://api.openai.com/v1"
+elif REQUESTY_API_KEY:
+    # A bare REQUESTY_API_KEY without a base URL has no known safe default.
+    REQUESTY_BASE_URL = ""
 else:
-    REQUESTY_BASE_URL = "https://api.17.wtf/v1"
+    REQUESTY_BASE_URL = ""
 
 if os.getenv("REQUESTY_MODEL"):
     REQUESTY_MODEL = os.getenv("REQUESTY_MODEL", "").strip()
@@ -58,16 +99,25 @@ elif GEMINI_API_KEY and REQUESTY_API_KEY == GEMINI_API_KEY:
     REQUESTY_MODEL = "gemini-2.0-flash"
 elif OPENAI_API_KEY and REQUESTY_API_KEY == OPENAI_API_KEY:
     REQUESTY_MODEL = "gpt-4o-mini"
+elif REQUESTY_API_KEY:
+    REQUESTY_MODEL = ""
 else:
-    REQUESTY_MODEL = "posiden/deepseek-v4-flash"
-TRANSLATE_FA = os.getenv("TRANSLATE_FA", "true").lower() in ("1", "true", "yes")
-TRANSLATION_TIMEOUT = float(os.getenv("TRANSLATION_TIMEOUT", "20"))
-TRANSLATION_DELIVERY_TIMEOUT = max(1.0, float(os.getenv("TRANSLATION_DELIVERY_TIMEOUT", "15")))
-TRANSLATION_RETRIES = int(os.getenv("TRANSLATION_RETRIES", "2"))
-TRANSLATION_CONCURRENT_LIMIT = int(os.getenv("TRANSLATION_CONCURRENT_LIMIT", "1"))
-TRANSLATION_BACKFILL_LIMIT = int(os.getenv("TRANSLATION_BACKFILL_LIMIT", "15"))
-MAX_TWEETS_PER_CHECK = int(os.getenv("MAX_TWEETS_PER_CHECK", "10"))
-MYMEMORY_SOURCE_LANG = os.getenv("MYMEMORY_SOURCE_LANG", "en").strip() or "en"
+    REQUESTY_MODEL = ""
+
+if REQUESTY_API_KEY and not (REQUESTY_BASE_URL and REQUESTY_MODEL):
+    logging.getLogger(__name__).warning(
+        "REQUESTY_API_KEY set but REQUESTY_BASE_URL/REQUESTY_MODEL incomplete; "
+        "AI translation disabled — set both or use GEMINI_API_KEY/OPENAI_API_KEY."
+    )
+    REQUESTY_API_KEY = ""
+TRANSLATE_FA = _env_value("TRANSLATE_FA", "true").lower() in ("1", "true", "yes")
+TRANSLATION_TIMEOUT = _env_float("TRANSLATION_TIMEOUT", 20, minimum=1.0)
+TRANSLATION_DELIVERY_TIMEOUT = _env_float("TRANSLATION_DELIVERY_TIMEOUT", 15, minimum=1.0)
+TRANSLATION_RETRIES = _env_int("TRANSLATION_RETRIES", 2, minimum=1)
+TRANSLATION_CONCURRENT_LIMIT = _env_int("TRANSLATION_CONCURRENT_LIMIT", 1, minimum=1)
+TRANSLATION_BACKFILL_LIMIT = _env_int("TRANSLATION_BACKFILL_LIMIT", 15, minimum=1)
+MAX_TWEETS_PER_CHECK = _env_int("MAX_TWEETS_PER_CHECK", 10, minimum=1)
+MYMEMORY_SOURCE_LANG = os.getenv("MYMEMORY_SOURCE_LANG", "").strip() or "en"
 MYMEMORY_EMAIL = os.getenv("MYMEMORY_EMAIL", "").strip()
 
 # Set LOG_LEVEL=DEBUG to see why each RSS entry was kept or skipped by the retweet filter.
@@ -112,13 +162,11 @@ logger = logging.getLogger(__name__)
 db = Database()
 if not db.enabled:
     logger.warning("Running without database - /add, /list, dashboard disabled")
-if not TOKEN:
-    logger.critical("TELEGRAM_BOT_TOKEN is not set! Bot polling will fail. Add it to your .env file.")
-if X_BEARER_TOKEN:
-    logger.info("Official X API source is configured; public RSS is a fallback.")
-else:
+if not X_BEARER_TOKEN:
     logger.warning("X_BEARER_TOKEN is not set; tweet checks will rely on public RSSHub/RSS mirrors, which may be unavailable.")
-app = FastAPI()
+else:
+    logger.info("Official X API source is configured; public RSS is a fallback.")
+
 templates = Jinja2Templates(directory=os.path.join(BASE_PATH, "templates"))
 
 http: httpx.AsyncClient = None
@@ -1037,10 +1085,6 @@ async def cmd_quick_dashboard(update, context):
     await update.message.reply_text("🌐 داشبورد لایو توییترها:", reply_markup=kb)
 
 
-async def cmd_quick_refresh(update, context):
-    await update.message.reply_text("🔄 در حال بروزرسانی...")
-
-
 async def handle_text(update, context):
     text = update.message.text.strip()
     if not text:
@@ -1106,6 +1150,9 @@ async def cmd_status(update, context):
     if REQUESTY_API_KEY:
         lines.append(f"🧠 <b>مدل:</b> {REQUESTY_MODEL}")
 
+    if check_state.get("last_finished"):
+        lines.append(f"✅ <b>آخرین بررسی:</b> {check_state['last_finished'][:16].replace('T', ' ')} UTC ({check_state['last_duration']}s، {check_state['errors']} خطا)")
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def cmd_add(update, context):
@@ -1114,7 +1161,7 @@ async def cmd_add(update, context):
         return
     raw = " ".join(context.args)
     if not raw.strip():
-        await update.message.reply_text("UsageId: /add username1 username2", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("⚠️ استفاده: <code>/add username1 username2</code>", parse_mode=ParseMode.HTML)
         return
     users = list(set([clean_username(u) for u in re.split(r"[,\s]+", raw) if u]))
     added, skipped = [], []
@@ -1138,7 +1185,7 @@ async def cmd_add(update, context):
 
 async def cmd_del(update, context):
     if not context.args:
-        await update.message.reply_text("UsageId: /del username")
+        await update.message.reply_text("⚠️ استفاده: <code>/del username</code>", parse_mode=ParseMode.HTML)
         return
     for arg in context.args:
         db.remove_subscription(update.effective_chat.id, clean_username(arg))
@@ -1503,36 +1550,68 @@ async def process_user(username, last_id, bot, sem):
             break
         db.update_last_id(username, tweet_id)
 
+# Runtime observability for /status and /healthz: when did the last feed check
+# run, how long did it take, and how many accounts errored. Updated by check_updates.
+check_state = {
+    "running": False,
+    "last_started": None,   # UTC ISO timestamp
+    "last_finished": None,  # UTC ISO timestamp
+    "last_duration": None,  # seconds
+    "accounts": 0,
+    "errors": 0,
+}
+
 
 async def check_updates(context):
-    started_at = time.monotonic()
-    tracked = db.get_all_tracked() or []
-    if not tracked:
-        logger.info("Update check finished: no tracked accounts in the database.")
+    # PTB's run_repeating schedules the next run regardless of whether the
+    # previous one finished: a slow check (dead feed, stalled translation) would
+    # overlap with the next one and duplicate Telegram sends. Skip instead.
+    if check_state["running"]:
+        logger.warning("Previous feed check is still running; skipping this tick.")
         return
+    check_state["running"] = True
+    started_at = time.monotonic()
+    try:
+        tracked = db.get_all_tracked() or []
+        check_state["accounts"] = len(tracked)
+        check_state["last_started"] = datetime.now(timezone.utc).isoformat()
+        if not tracked:
+            logger.info("Update check finished: no tracked accounts in the database.")
+            return
 
-    logger.info("Checking feeds for %s tracked accounts.", len(tracked))
-    bot = context.application.bot
-    sem = asyncio.Semaphore(CONCURRENT_LIMIT)
-    tasks = [process_user(u, li, bot, sem) for u, li in tracked]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    failures = 0
-    for (username, _), result in zip(tracked, results):
-        if isinstance(result, Exception):
-            failures += 1
-            logger.error(
-                "Error processing @%s: %s",
-                username,
-                result,
-                exc_info=(type(result), result, result.__traceback__),
-            )
+        logger.info("Checking feeds for %s tracked accounts.", len(tracked))
+        bot = context.application.bot
+        sem = asyncio.Semaphore(CONCURRENT_LIMIT)
+        tasks = [process_user(u, li, bot, sem) for u, li in tracked]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        failures = 0
+        for (username, _), result in zip(tracked, results):
+            if isinstance(result, Exception):
+                failures += 1
+                logger.error(
+                    "Error processing @%s: %s",
+                    username,
+                    result,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
 
-    logger.info(
-        "Feed check finished in %.1f seconds (%s accounts, %s errors).",
-        time.monotonic() - started_at,
-        len(tracked),
-        failures,
-    )
+        logger.info(
+            "Feed check finished in %.1f seconds (%s accounts, %s errors).",
+            time.monotonic() - started_at,
+            len(tracked),
+            failures,
+        )
+        check_state["errors"] = failures
+    except Exception:
+        logger.exception("Feed check crashed")
+        raise
+    finally:
+        # report the most recently *completed* run to /healthz and /status;
+        # last_started stays as the start time of this run.
+        duration = time.monotonic() - started_at
+        check_state["last_finished"] = datetime.now(timezone.utc).isoformat()
+        check_state["last_duration"] = round(duration, 1)
+        check_state["running"] = False
 
 
 async def run_translation_backfill(context):
@@ -1633,6 +1712,28 @@ async def lifespan(fastapi_app):
     await http.aclose()
 
 app = FastAPI(lifespan=lifespan)
+
+
+def _health_payload():
+    """Fine for uptime monitors; 503 only when a hard dependency is unusable."""
+    ok = bool(TOKEN) and (db.enabled or not (os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")))
+    return {
+        "ok": ok,
+        "database": "ok" if db.enabled else "disabled",
+        "feed_source": "dedicated-rsshub" if RSSHUB_BASE_URL != PUBLIC_RSSHUB_BASE_URL else "public-mirrors",
+        "x_api": bool(X_BEARER_TOKEN),
+        "check_interval": CHECK_INTERVAL,
+        "last_check": {k: check_state[k] for k in ("running", "last_started", "last_finished", "last_duration", "accounts", "errors")},
+    }
+
+
+@app.get("/healthz")
+async def healthz():
+    """Uptime/health probe for Railway or any external monitor."""
+    payload = _health_payload()
+    status = 200 if payload["ok"] else 503
+    return JSONResponse(payload, status_code=status)
+
 
 def _tweet_to_dict(t):
     return {

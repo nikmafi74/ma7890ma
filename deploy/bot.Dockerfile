@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-COPY twitter_telegram_bot.py database.py web_server.py ./
+COPY twitter_telegram_bot.py database.py ./
 COPY templates/ ./templates/
 COPY manifest.json sw.js ./
 
