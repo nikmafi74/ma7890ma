@@ -1,4 +1,5 @@
 import os, asyncio, logging, feedparser, re, httpx, html, hashlib, time
+from urllib.parse import quote
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -128,8 +129,30 @@ translation_sem = asyncio.Semaphore(max(1, TRANSLATION_CONCURRENT_LIMIT))
 rss_fetch_sem = asyncio.Semaphore(RSS_FETCH_CONCURRENCY)
 
 RSSHUB_BASE_URL = (os.getenv("RSSHUB_BASE_URL") or "https://rsshub.app").strip().rstrip("/")
+# Shared secret for a private RSSHub instance (RSSHub side sets ACCESS_KEY to the same
+# value). Every RSSHub request then carries ?key=... so strangers cannot use the instance.
+RSSHUB_ACCESS_KEY = os.getenv("RSSHUB_ACCESS_KEY", "").strip()
+PUBLIC_RSSHUB_BASE_URL = "https://rsshub.app"
+
+
+def build_rsshub_user_feed_url(base_url=None, access_key=None):
+    """Build the RSSHub user-timeline feed URL template.
+
+    A dedicated RSSHub only needs an X account cookie (TWITTER_AUTH_TOKEN on the
+    RSSHub side), never an X API Bearer Token. When the instance is protected
+    with RSSHub's ACCESS_KEY, the key travels as a percent-encoded `key` query
+    parameter, so the template stays safe for `.format(username=...)`.
+    """
+    base = (RSSHUB_BASE_URL if base_url is None else base_url or "").strip().rstrip("/")
+    key = (RSSHUB_ACCESS_KEY if access_key is None else access_key or "").strip()
+    url = f"{base}/twitter/user/{{username}}"
+    if key:
+        url += f"?key={quote(key, safe='')}"
+    return url
+
+
 RSS_SOURCES = [
-    f"{RSSHUB_BASE_URL}/twitter/user/{{username}}",
+    build_rsshub_user_feed_url(),
     "https://nitter.net/{username}/rss",
     "https://xcancel.com/{username}/rss",
     "https://nitter.perennialte.ch/{username}/rss",
@@ -139,6 +162,19 @@ RSS_SOURCES = [
     "https://nitter.cz/{username}/rss",
     "https://nitter.netbub.com/{username}/rss",
 ]
+
+if RSSHUB_BASE_URL != PUBLIC_RSSHUB_BASE_URL:
+    logger.info(
+        "Dedicated RSSHub instance configured: %s%s",
+        RSSHUB_BASE_URL,
+        " (requests signed with RSSHUB_ACCESS_KEY)" if RSSHUB_ACCESS_KEY else "",
+    )
+else:
+    logger.info(
+        "No dedicated RSSHub configured; using the public instance plus RSS mirrors. "
+        "Set RSSHUB_BASE_URL (and optionally RSSHUB_ACCESS_KEY) for reliable feeds."
+    )
+
 RSS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
@@ -676,6 +712,36 @@ async def _try_feed_instance(url, target_username):
         return None
 
 
+async def probe_rsshub_instance():
+    """Best-effort /healthz check of the configured RSSHub instance.
+
+    The bot keeps working either way — public mirrors stay as fallbacks — but a
+    dedicated instance that is down or misconfigured becomes visible right after
+    boot instead of after a silent streak of failed feed checks.
+    """
+    if not RSSHUB_BASE_URL or http is None:
+        return
+    try:
+        resp = await http.get(f"{RSSHUB_BASE_URL}/healthz", timeout=5)
+    except Exception as e:
+        logger.warning(
+            "RSSHub %s did not answer /healthz (%s: %r); feed checks will still try it "
+            "and fall back to public mirrors.",
+            RSSHUB_BASE_URL,
+            type(e).__name__,
+            e,
+        )
+        return
+    if resp.status_code == 200:
+        logger.info("RSSHub %s is up (HTTP 200 on /healthz).", RSSHUB_BASE_URL)
+    else:
+        logger.warning(
+            "RSSHub %s answered HTTP %s on /healthz; feeds may fail or be rate-limited.",
+            RSSHUB_BASE_URL,
+            resp.status_code,
+        )
+
+
 def _x_api_entries_from_payload(username, payload):
     """Convert an X API v2 timeline response to the dict shape used by RSS entries."""
     includes = payload.get("includes") or {}
@@ -1019,12 +1085,17 @@ async def cmd_status(update, context):
     missing_translation_count = db.count_missing_translations() if db.enabled else 0
     ai_status = "✅ AI + Google/MyMemory fallback" if REQUESTY_API_KEY else "⚠️ Google/MyMemory fallback"
     db_status = "✅ PostgreSQL" if db.enabled else "❌ غیرفعال"
+    if RSSHUB_BASE_URL != PUBLIC_RSSHUB_BASE_URL:
+        feed_source = f"✅ RSSHub اختصاصی{' 🔒' if RSSHUB_ACCESS_KEY else ''}"
+    else:
+        feed_source = "⚠️ عمومی (RSSHub/آینه‌ها)"
 
     lines = [
         "📊 <b>وضعیت ربات</b>",
         "",
         f"🤖 <b>ترجمه:</b> {ai_status}",
         f"💾 <b>دیتابیس:</b> {db_status}",
+        f"📡 <b>منبع فید:</b> {feed_source}",
         f"📝 <b>توییت‌های ذخیره شده:</b> {tweet_count}",
         f"🦁 <b>بدون ترجمه:</b> {missing_translation_count}",
         f"👤 <b>اکانت‌های شما:</b> {len(set(users))}",
@@ -1502,6 +1573,9 @@ async def lifespan(fastapi_app):
         RSS_FETCH_CONCURRENCY,
         RSS_FETCH_TIMEOUT,
     )
+    # Surface a broken dedicated RSSHub (wrong URL, missing access key, sleeping
+    # free-tier dyno, ...) immediately instead of via cryptic feed failures.
+    await probe_rsshub_instance()
 
     from telegram.ext import MessageHandler, filters
 

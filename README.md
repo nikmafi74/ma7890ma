@@ -14,7 +14,7 @@
 
 <p align="center">
   <b>Forward new posts from X to Telegram.</b><br>
-  Works without an X API token via RSSHub and public RSS mirrors; the official X API v2 is an optional, more direct source. Public feeds may be unavailable. Supports AI-powered Persian translation.<br>
+  Works without an X API token: run your own RSSHub with a plain X account cookie, or fall back to public RSS mirrors; the official X API v2 is an optional, more direct source. Supports AI-powered Persian translation.<br>
   Includes a live web dashboard + PWA.
 </p>
 
@@ -25,6 +25,7 @@
 | Feature | Description |
 |---------|-------------|
 | 🔄 **Auto Forward** | Tweets delivered to Telegram automatically |
+| 🛰 **Dedicated RSSHub** | Token-free reliable feeds from your own RSSHub instance (Railway or Docker Compose) |
 | 🦁 **AI Translation** | Gemini / Google Translate to Persian |
 | 🚫 **Retweet Filter** | Skips retweets/reposts, without misreading display names as handles |
 | 🖼️ **Media Support** | Photos included with tweets |
@@ -75,7 +76,7 @@ REQUESTY_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
 REQUESTY_MODEL=gemini-2.0-flash
 ```
 
-`X_BEARER_TOKEN` is optional. Without it, the bot tries the public RSSHub route (`https://rsshub.app/twitter/user/<username>`) and other RSS mirrors; these public services can be rate-limited or unavailable. If you have X API read access, set its Bearer Token in your host's secrets (never commit or paste it). You can point `RSSHUB_BASE_URL` at another RSSHub instance.
+`X_BEARER_TOKEN` is optional. Without it, the bot tries the public RSSHub route (`https://rsshub.app/twitter/user/<username>`) and other RSS mirrors; these public services can be rate-limited or unavailable. If you have X API read access, set its Bearer Token in your host's secrets (never commit or paste it). For a reliable token-free setup, deploy a **dedicated RSSHub** (next section) and point `RSSHUB_BASE_URL` at it.
 
 ### 4. Run
 
@@ -84,6 +85,64 @@ python twitter_telegram_bot.py
 ```
 
 Open `http://localhost:8080` for the live dashboard.
+
+---
+
+## 🛰 Dedicated RSSHub — reliable feeds, no X API token
+
+The most dependable way to run this bot is with your **own RSSHub instance**. RSSHub's `/twitter/user/:username` route reads timelines using the cookie of a normal, logged-in X account — **no developer account, no paid API, no Bearer Token**. The bot then queries your instance first and keeps the public mirrors only as fallback.
+
+### 1. Get an X account cookie (`TWITTER_AUTH_TOKEN`)
+
+1. Log in to [x.com](https://x.com) in a browser — use a **dedicated/burner account** (automation can get an account limited, and the cookie grants full access to it).
+2. Open DevTools (`F12`) → **Application** → **Cookies** → `https://x.com`.
+3. Copy the value of `auth_token` (a ~40-char hex string).
+
+Keep it secret (treat it like a password), don't log that browser session out (it invalidates the cookie), and know that several cookies can be combined comma-separated for rotation.
+
+### 2. Deploy the instance
+
+**Option A — Railway (same project as the bot):**
+
+1. In your Railway project: **New** → **GitHub Repo** → deploy the public repo [`DIYgod/RSSHub`](https://github.com/DIYgod/RSSHub) (Railway can deploy public repos directly; no fork needed — it builds from the repo's own `Dockerfile`/`railway.json`).
+2. On the RSSHub service, add variables:
+   - `NODE_ENV=production`
+   - `TWITTER_AUTH_TOKEN` — the cookie from step 1
+   - `ACCESS_KEY` — a long random string so strangers can't use your instance
+3. **Settings → Networking → Generate Domain** for the RSSHub service.
+4. On the **bot** service set:
+   - `RSSHUB_BASE_URL=https://<your-rsshub-domain>.up.railway.app`
+   - `RSSHUB_ACCESS_KEY` — the same string as `ACCESS_KEY`
+
+**Option B — any server with Docker (full stack in one command):**
+
+```bash
+cp deploy/.env.example deploy/.env   # fill in the values
+docker compose -f deploy/docker-compose.yml up -d --build
+```
+
+That starts **RSSHub + Redis + PostgreSQL + this bot** as one private stack; the bot is wired to `http://rsshub:1200` automatically. The dashboard is served on port `8080`.
+
+### 3. Verify
+
+```bash
+curl "https://<your-rsshub-domain>/twitter/user/nasa?key=<ACCESS_KEY>"
+```
+
+- Returns XML with tweets → working.
+- Bot startup log shows: `RSSHub <url> is up (HTTP 200 on /healthz)`.
+- Send `/status` in Telegram → `📡 منبع فید: ✅ RSSHub اختصاصی`.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Feed says `Twitter authentication cookie is not valid` | The cookie expired/rotated — log in again and update `TWITTER_AUTH_TOKEN` (password changes and logouts invalidate it) |
+| Instance is up but timelines are empty | X often blocks datacenter IPs — set `PROXY_URI` (e.g. `http://user:pass@host:port` or `socks5h://host:port`) on the RSSHub service, or route via `TWITTER_THIRD_PARTY_API` |
+| Wrong `ACCESS_KEY` on the bot side | Requests fail with HTTP 403 — the bot logs it and falls back to public mirrors until fixed |
+| Instance briefly down | Nothing to do — the bot automatically falls back to public RSS mirrors and resumes your instance when it answers |
+
+> ⚠️ Reading X through an account cookie is against X's ToS; use a throwaway account you can afford to lose.
 
 ---
 
@@ -140,11 +199,14 @@ Searches saved tweets and shares them inline.
 | `TELEGRAM_BOT_TOKEN` | Your bot token |
 | `DATABASE_URL` | Auto-set by Railway |
 | `X_BEARER_TOKEN` | Optional Bearer Token with X API read access; otherwise RSSHub/RSS mirrors are used |
-| `RSSHUB_BASE_URL` | Optional; defaults to `https://rsshub.app` |
+| `RSSHUB_BASE_URL` | Your dedicated RSSHub URL (recommended — see [Dedicated RSSHub](#-dedicated-rsshub--reliable-feeds-no-x-api-token)); defaults to `https://rsshub.app` |
+| `RSSHUB_ACCESS_KEY` | Must match the RSSHub instance's `ACCESS_KEY`, if you set one |
 | `REQUESTY_API_KEY` | Your Gemini key |
 | `REQUESTY_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` |
 | `REQUESTY_MODEL` | `gemini-2.0-flash` |
 | `TRANSLATE_FA` | `true` |
+
+Tip: add the RSSHub as a **second service in the same Railway project** (New → GitHub Repo → `DIYgod/RSSHub`, variables `NODE_ENV`, `TWITTER_AUTH_TOKEN`, `ACCESS_KEY`) and point `RSSHUB_BASE_URL` at its generated domain — no X API token needed anywhere.
 
 7. Deploy! 🎉
 
@@ -158,10 +220,15 @@ twitter-telegram-bot/
 ├── database.py               # PostgreSQL manager
 ├── templates/
 │   └── index.html            # Dashboard UI (PWA)
+├── deploy/
+│   ├── docker-compose.yml    # One-command private stack: RSSHub + Redis + PostgreSQL + bot
+│   ├── bot.Dockerfile        # Bot container image (used by the compose stack)
+│   └── .env.example          # Variables for the compose stack
 ├── sw.js                     # Service Worker
 ├── manifest.json             # PWA manifest
 ├── requirements.txt          # Dependencies
 ├── Procfile                  # Railway config
+├── .env.example              # Bot variable reference
 ├── README_FA.md              # 🇮🇷 Persian docs
 └── README.md                 # 🇬🇧 English docs
 ```
@@ -175,7 +242,8 @@ twitter-telegram-bot/
 | `X_BEARER_TOKEN` | empty | Optional X API v2 Bearer Token; used when configured |
 | `X_API_BASE_URL` | `https://api.x.com/2` | X API v2 base URL |
 | `X_USER_ID_CACHE_TTL` | `86400` | Cache lifetime for resolved X user IDs (seconds) |
-| `RSSHUB_BASE_URL` | `https://rsshub.app` | RSSHub instance included among RSS sources when X API is not configured or fails |
+| `RSSHUB_BASE_URL` | `https://rsshub.app` | RSSHub instance included among RSS sources when X API is not configured or fails; point it at your dedicated instance for reliable token-free feeds |
+| `RSSHUB_ACCESS_KEY` | empty | Must match `ACCESS_KEY` on your RSSHub instance; sent as `?key=` on every RSSHub request |
 | `HTTP_MAX_CONNECTIONS` | `50` | HTTP connection-pool size; leaves room beyond bounded RSS requests |
 | `RSS_FETCH_TIMEOUT` | `12` | Maximum time spent checking RSS mirrors for one account (seconds) |
 | `RSS_MERGE_GRACE` | `0.25` | Extra seconds to merge fast mirror responses after the first usable feed |
@@ -201,6 +269,7 @@ twitter-telegram-bot/
 
 - ❌ Private accounts require authenticated access
 - ✅ Official X API v2 is used when `X_BEARER_TOKEN` is configured
+- 🛰 Best without an X API token: a dedicated RSSHub instance (see [Dedicated RSSHub](#-dedicated-rsshub--reliable-feeds-no-x-api-token)) — its health is checked at startup and shown in `/status`
 - ⚠️ Without it, public RSSHub and Nitter mirrors are tried but are best-effort and may be unavailable
 - ✅ Retweets/reposts are filtered out; a display name (e.g. `RippleX`) is never mistaken for a handle, so accounts stay visible
 - ✅ With `LOG_LEVEL=DEBUG` every skipped entry is logged with its reason (e.g. `Skip @nasa 123: status link is @nasa`)

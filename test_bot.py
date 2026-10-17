@@ -7,8 +7,10 @@ from twitter_telegram_bot import (
     TELEGRAM_CAPTION_LIMIT,
     TELEGRAM_TEXT_LIMIT,
     RSS_SOURCES,
+    PUBLIC_RSSHUB_BASE_URL,
     build_content,
     build_message,
+    build_rsshub_user_feed_url,
     deliver,
     escape_and_truncate,
     extract_author_username,
@@ -19,6 +21,7 @@ from twitter_telegram_bot import (
     _try_feed_instance,
     _x_api_entries_from_payload,
     is_retweet,
+    probe_rsshub_instance,
     process_user,
     run_translation_backfill,
     translate_text,
@@ -284,6 +287,56 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
 
     def test_public_rsshub_is_in_rss_fallback_sources(self):
         self.assertTrue(any(source.endswith("/twitter/user/{username}") for source in RSS_SOURCES))
+
+    def test_rsshub_user_feed_url_builder(self):
+        """A dedicated RSSHub needs no X API token; an access key rides along as ?key=."""
+        # Default: no access key, trailing slash tolerated.
+        self.assertEqual(
+            build_rsshub_user_feed_url("http://rsshub:1200/"),
+            "http://rsshub:1200/twitter/user/{username}",
+        )
+        # Access key must be percent-encoded so .format() templates stay injectable.
+        signed = build_rsshub_user_feed_url("https://rss.example.org", "top secret/&")
+        self.assertEqual(signed, "https://rss.example.org/twitter/user/{username}?key=top%20secret%2F%26")
+        self.assertEqual(signed.format(username="nasa"), "https://rss.example.org/twitter/user/nasa?key=top%20secret%2F%26")
+        # Explicitly empty key behaves like no key.
+        self.assertEqual(
+            build_rsshub_user_feed_url("http://rsshub:1200", ""),
+            "http://rsshub:1200/twitter/user/{username}",
+        )
+
+    async def test_probe_rsshub_instance_reports_health(self):
+        ok = MagicMock(status_code=200)
+        client = MagicMock()
+        client.get = AsyncMock(return_value=ok)
+        with patch("twitter_telegram_bot.http", client):
+            await probe_rsshub_instance()  # must not raise
+        self.assertEqual(client.get.await_count, 1)
+        self.assertTrue(client.get.await_args.args[0].endswith("/healthz"))
+
+    async def test_probe_rsshub_instance_tolerates_unreachable_instance(self):
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=ConnectionError("no route to host"))
+        with patch("twitter_telegram_bot.http", client):
+            await probe_rsshub_instance()  # must not raise; mirrors stay fallbacks
+        self.assertEqual(client.get.await_count, 1)
+
+    async def test_rsshub_source_carries_access_key_when_configured(self):
+        """Feed fetching must hit the signed URL of a protected private RSSHub."""
+        template = build_rsshub_user_feed_url("http://rsshub:1200", "s3cret")
+        feed = self._rss(
+            "<item><title>new post</title>"
+            "<link>https://x.com/user/status/2111000000000000001</link>"
+            "<description>new post</description></item>"
+        )
+        client = MagicMock()
+        client.get = AsyncMock(return_value=MagicMock(status_code=200, text=feed, url="http://rsshub:1200/twitter/user/user?key=s3cret"))
+        with patch("twitter_telegram_bot.RSS_SOURCES", [template]), \
+             patch("twitter_telegram_bot.X_BEARER_TOKEN", ""), \
+             patch("twitter_telegram_bot.http", client):
+            entries = await fetch_feed("user")
+        self.assertEqual(client.get.await_args.args[0], "http://rsshub:1200/twitter/user/user?key=s3cret")
+        self.assertEqual([extract_id(e) for e in entries], ["2111000000000000001"])
 
     async def test_rss_requests_obey_global_concurrency_limit(self):
         active = 0
