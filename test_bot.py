@@ -8,6 +8,9 @@ from twitter_telegram_bot import (
     TELEGRAM_TEXT_LIMIT,
     RSS_SOURCES,
     PUBLIC_RSSHUB_BASE_URL,
+    _mirror_mark_failure,
+    _mirror_mark_success,
+    mirror_health,
     build_content,
     build_message,
     build_rsshub_user_feed_url,
@@ -33,6 +36,7 @@ from twitter_telegram_bot import (
 class TestTweetBot(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         translations_cache.clear()
+        mirror_health.clear()
 
     def test_utf16_len(self):
         self.assertEqual(utf16_len("hello"), 5)
@@ -658,6 +662,102 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
 
         # Bot must NEVER be called during backfill
         self.assertEqual(bot.send_message.call_count, 0)
+
+    def _item(self, tweet_id, title="hello post"):
+        return (
+            f"<item><title>{title}</title>"
+            f"<link>https://x.com/user/status/{tweet_id}</link>"
+            f"<description>{title}</description></item>"
+        )
+
+    async def test_circuit_breaker_skips_dead_mirror_after_threshold(self):
+        """A mirror failing N consecutive checks is benched and not queried anymore."""
+        rss = self._rss(self._item("2111000000000000001"))
+
+        calls = []
+
+        async def get(url, **_kwargs):
+            calls.append(url)
+            if "breaker-a" in url:
+                return MagicMock(status_code=503, url=url)
+            await asyncio.sleep(0.01)
+            return MagicMock(status_code=200, text=rss, url=url)
+
+        sources = [
+            "https://breaker-a.example/{username}/rss",
+            "https://breaker-b.example/{username}/rss",
+        ]
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=get)
+        with patch("twitter_telegram_bot.RSS_SOURCES", sources), \
+             patch("twitter_telegram_bot.X_BEARER_TOKEN", ""), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_THRESHOLD", 2), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_COOLDOWN", 10**9), \
+             patch("twitter_telegram_bot.RSS_MERGE_GRACE", 0), \
+             patch("twitter_telegram_bot.http", client):
+            for _ in range(3):
+                await fetch_feed("user")
+
+        # Runs 1 and 2 hit both mirrors (cooldown arms on the 2nd failure); run 3
+        # must skip breaker-a entirely.
+        self.assertEqual(len([u for u in calls if "breaker-a" in u]), 2)
+        self.assertEqual(len([u for u in calls if "breaker-b" in u]), 3)
+
+    async def test_circuit_breaker_never_blinds_all_mirrors(self):
+        """When every mirror is benched, the soonest one is still probed."""
+        calls = []
+
+        async def get(url, **_kwargs):
+            calls.append(url)
+            return MagicMock(status_code=403, url=url)
+
+        sources = [
+            "https://breaker-x.example/{username}/rss",
+            "https://breaker-y.example/{username}/rss",
+        ]
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=get)
+        with patch("twitter_telegram_bot.RSS_SOURCES", sources), \
+             patch("twitter_telegram_bot.X_BEARER_TOKEN", ""), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_THRESHOLD", 1), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_COOLDOWN", 10**9), \
+             patch("twitter_telegram_bot.http", client):
+            await fetch_feed("user")
+            await fetch_feed("user")
+
+        # Run 1 probes both mirrors; run 2 probes exactly the soonest (breaker-x,
+        # benched first) instead of going blind.
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len([u for u in calls if "breaker-x" in u]), 2)
+        self.assertEqual(len([u for u in calls if "breaker-y" in u]), 1)
+
+    def test_mirror_breaker_resets_on_success(self):
+        """Two hard failures bench a mirror; one success clears it again."""
+        with patch("twitter_telegram_bot.MIRROR_BREAKER_THRESHOLD", 2), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_COOLDOWN", 10**9):
+            host = "https://reset.example/{username}/rss"
+            _mirror_mark_failure(host)
+            # Below threshold: the record tracks the failure but the mirror is NOT benched.
+            below = mirror_health["reset.example"]
+            self.assertEqual(below["fails"], 1)
+            self.assertEqual(below["retry_after"], 0.0)
+            _mirror_mark_failure(host)
+            record = mirror_health["reset.example"]
+            self.assertEqual(record["fails"], 2)
+            self.assertGreater(record["retry_after"], 0)
+            _mirror_mark_success(host)
+            self.assertEqual(mirror_health["reset.example"], {"fails": 0, "retry_after": 0.0})
+
+    def test_dedicated_rsshub_is_exempt_from_breaker(self):
+        """A configured dedicated RSSHub instance is never benched."""
+        with patch("twitter_telegram_bot.RSSHUB_BASE_URL", "http://rsshub.internal:1200"), \
+             patch("twitter_telegram_bot.PUBLIC_RSSHUB_BASE_URL", "https://rsshub.app"), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_THRESHOLD", 1), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_COOLDOWN", 10**9):
+            _mirror_mark_failure("http://rsshub.internal:1200/twitter/user/{username}")
+            _mirror_mark_failure("https://public.example/rss")
+            self.assertNotIn("rsshub.internal:1200", mirror_health)
+            self.assertIn("public.example", mirror_health)
 
 
 if __name__ == "__main__":

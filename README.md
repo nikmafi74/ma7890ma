@@ -247,6 +247,8 @@ twitter-telegram-bot/
 | `HTTP_MAX_CONNECTIONS` | `50` | HTTP connection-pool size; leaves room beyond bounded RSS requests |
 | `RSS_FETCH_TIMEOUT` | `12` | Maximum time spent checking RSS mirrors for one account (seconds) |
 | `RSS_MERGE_GRACE` | `0.25` | Extra seconds to merge fast mirror responses after the first usable feed |
+| `MIRROR_BREAKER_THRESHOLD` | `3` | Consecutive failures that bench a dead public mirror (circuit breaker) — cuts ~85% of wasted feed requests since only 1–2 mirrors usually work |
+| `MIRROR_BREAKER_COOLDOWN` | `1800` | How long a benched mirror stays out of rotation (seconds); your dedicated RSSHub instance is never benched |
 | `CHECK_INTERVAL` | `300` | Check interval (seconds) |
 | `TRANSLATE_FA` | `true` | Enable Persian translation |
 | `REQUESTY_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY` | empty | AI provider key for higher quality translation |

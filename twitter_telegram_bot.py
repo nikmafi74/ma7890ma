@@ -1,5 +1,5 @@
 import os, asyncio, logging, feedparser, re, httpx, html, hashlib, time, sys
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -69,6 +69,14 @@ RSS_FETCH_CONCURRENCY = _env_int("RSS_FETCH_CONCURRENCY", 12, minimum=1)
 # Bound every account's mirror sweep and only wait briefly to merge other fast replies.
 RSS_FETCH_TIMEOUT = _env_float("RSS_FETCH_TIMEOUT", 12, minimum=1.0)
 RSS_MERGE_GRACE = _env_float("RSS_MERGE_GRACE", 0.25, minimum=0.0)
+# Circuit breaker for feed mirrors: most public mirrors are permanently dead
+# (DNS gone, HTTP 403/410/451). Every tracked account used to hit every dead
+# mirror on every check. After N consecutive hard failures a mirror is benched
+# for a cooldown, cutting ~85% of feed traffic with no behavior change; the
+# benched mirrors are also re-probed periodically in case they come back.
+MIRROR_BREAKER_THRESHOLD = _env_int("MIRROR_BREAKER_THRESHOLD", 3, minimum=1)
+MIRROR_BREAKER_COOLDOWN = _env_int("MIRROR_BREAKER_COOLDOWN", 1800, minimum=60)
+mirror_health = {}  # host -> {"fails": int, "retry_after": monotonic ts}]
 
 PLACEHOLDER_API_KEYS = {"key", "your_key", "your_api_key", "your_gemini_api_key", "your_requesty_or_gemini_key"}
 
@@ -903,6 +911,53 @@ def _tweet_id_newest_first_key(tweet_id):
     return (0, -int(value)) if value.isdigit() else (1, value)
 
 
+def _mirror_host(source):
+    return urlparse(source).netloc
+
+
+def _mirror_is_exempt(source):
+    """The dedicated RSSHub instance never enters the breaker: a brief outage
+    (free-tier slowdown, deploy) must not bench it for half an hour while the
+    bot silently runs on dead public mirrors. The public rsshub.app default is
+    NOT exempt — it is just as dead/alive as any other mirror."""
+    host = _mirror_host(source)
+    return bool(host) and host == _mirror_host(RSSHUB_BASE_URL) and RSSHUB_BASE_URL != PUBLIC_RSSHUB_BASE_URL
+
+
+def _mirror_mark_success(source):
+    mirror_health[_mirror_host(source)] = {"fails": 0, "retry_after": 0.0}
+
+
+def _mirror_mark_failure(source):
+    host = _mirror_host(source)
+    if not host or _mirror_is_exempt(source):
+        return
+    record = mirror_health.setdefault(host, {"fails": 0, "retry_after": 0.0})
+    record["fails"] += 1
+    if record["fails"] >= MIRROR_BREAKER_THRESHOLD:
+        record["retry_after"] = time.monotonic() + MIRROR_BREAKER_COOLDOWN
+        logger.info(
+            "Mirror %s benched for %ss after %s consecutive failures",
+            host,
+            MIRROR_BREAKER_COOLDOWN,
+            record["fails"],
+        )
+
+
+def _mirror_stats():
+    """(total sources, benched sources) for /status and /healthz."""
+    now = time.monotonic()
+    total = len(RSS_SOURCES)
+    benched = sum(
+        1
+        for source in RSS_SOURCES
+        if (record := mirror_health.get(_mirror_host(source)))
+        and record["fails"] >= MIRROR_BREAKER_THRESHOLD
+        and now < record["retry_after"]
+    )
+    return total, benched
+
+
 async def fetch_feed(username):
     """Race RSS mirrors, keep repost-only feeds from winning, and cap waiting time."""
     target_username = clean_username(username)
@@ -915,7 +970,28 @@ async def fetch_feed(username):
             )
         logger.warning("Falling back to public RSS mirrors for @%s", target_username)
 
-    sources = list(RSS_SOURCES)
+    all_sources = list(RSS_SOURCES)
+    sources = [
+        src
+        for src in all_sources
+        if (record := mirror_health.get(_mirror_host(src))) is None
+        or record["fails"] < MIRROR_BREAKER_THRESHOLD
+        or time.monotonic() >= record["retry_after"]
+    ]
+    if not sources and all_sources:
+        # The breaker must never blind the bot completely: when every mirror is
+        # benched, still probe the one whose cooldown expires soonest.
+        soonest_host = min(mirror_health, key=lambda host: mirror_health[host]["retry_after"])
+        sources = [src for src in all_sources if _mirror_host(src) == soonest_host][:1]
+        logger.info("All mirrors are in reset cooldown; probing the soonest: %s", soonest_host)
+    skipped = len(all_sources) - len(sources)
+    if skipped:
+        logger.debug(
+            "Circuit breaker skipped %s dead mirror(s); probing %s of %s.",
+            skipped,
+            len(sources),
+            len(all_sources),
+        )
     task_sources = {
         asyncio.create_task(
             _try_feed_instance(src.format(username=target_username), target_username)
@@ -958,9 +1034,12 @@ async def fetch_feed(username):
                         type(exc).__name__,
                         exc,
                     )
+                    _mirror_mark_failure(source)
                     continue
                 if result is None:
+                    _mirror_mark_failure(source)
                     continue
+                _mirror_mark_success(source)
                 usable_mirrors += 1
                 if result:
                     feed_results.append(result)
@@ -1152,6 +1231,9 @@ async def cmd_status(update, context):
 
     if check_state.get("last_finished"):
         lines.append(f"✅ <b>آخرین بررسی:</b> {check_state['last_finished'][:16].replace('T', ' ')} UTC ({check_state['last_duration']}s، {check_state['errors']} خطا)")
+
+    total_mirrors, benched_mirrors = _mirror_stats()
+    lines.append(f"🔁 <b>آینه‌های فید:</b> {total_mirrors - benched_mirrors} سالم از {total_mirrors}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -1723,6 +1805,7 @@ def _health_payload():
         "feed_source": "dedicated-rsshub" if RSSHUB_BASE_URL != PUBLIC_RSSHUB_BASE_URL else "public-mirrors",
         "x_api": bool(X_BEARER_TOKEN),
         "check_interval": CHECK_INTERVAL,
+        "mirrors": {"total": _mirror_stats()[0], "benched": _mirror_stats()[1]},
         "last_check": {k: check_state[k] for k in ("running", "last_started", "last_finished", "last_duration", "accounts", "errors")},
     }
 
