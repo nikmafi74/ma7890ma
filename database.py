@@ -40,6 +40,69 @@ class Database:
             if conn and not conn.closed:
                 self._pool.putconn(conn)
 
+    def try_acquire_advisory_lock(self, lock_id):
+        """Return a dedicated PostgreSQL session holding this lock, or None if busy.
+
+        Session-level advisory locks are released automatically when the connection
+        closes. Keep this connection outside the general query pool for as long as
+        the process owns the lock.
+        """
+        if not self.db_url:
+            raise RuntimeError("Database URL is not configured")
+        conn = psycopg2.connect(
+            self.db_url,
+            connect_timeout=5,
+            options="-c statement_timeout=5000",
+            keepalives=1,
+        )
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (int(lock_id),))
+                acquired = bool(cur.fetchone()[0])
+            if acquired:
+                return conn
+            conn.close()
+            return None
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+
+    @staticmethod
+    def advisory_lock_connection_alive(conn):
+        """Check the dedicated lock session and its keepalive query are still usable."""
+        if conn is None or conn.closed:
+            return False
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                return cur.fetchone() == (1,)
+        except Exception:
+            return False
+
+    @staticmethod
+    def release_advisory_lock(conn, lock_id):
+        """Release a session advisory lock and always close its dedicated connection."""
+        if conn is None:
+            return
+        try:
+            if not conn.closed:
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (int(lock_id),))
+        except Exception as exc:
+            # Closing a PostgreSQL session releases the lock even if explicit unlock
+            # fails (for example, after a database failover).
+            logger.debug("Could not explicitly release Telegram polling lock (%s)", type(exc).__name__)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _run(self, query, params=None, fetch="all", default=None):
         if not self.enabled:
             return default

@@ -133,6 +133,7 @@ curl "https://<your-rsshub-domain>/twitter/user/nasa?key=<ACCESS_KEY>"
 
 - Returns XML with tweets → working.
 - Bot startup log shows: `RSSHub <url> is up (HTTP 200 on /healthz)`.
+- `GET /healthz` should show `telegram.polling_state: "polling"`; replicas that show `"standby"` are waiting for the shared database lock.
 - Send `/status` in Telegram → `📡 منبع فید: ✅ RSSHub اختصاصی`.
 
 ### Troubleshooting
@@ -142,8 +143,9 @@ curl "https://<your-rsshub-domain>/twitter/user/nasa?key=<ACCESS_KEY>"
 | Feed says `Twitter authentication cookie is not valid` | The cookie expired/rotated — log in again and update `TWITTER_AUTH_TOKEN` (password changes and logouts invalidate it) |
 | Instance is up but timelines are empty | X often blocks datacenter IPs — set `PROXY_URI` (e.g. `http://user:pass@host:port` or `socks5h://host:port`) on the RSSHub service, or route via `TWITTER_THIRD_PARTY_API` |
 | Wrong `ACCESS_KEY` on the bot side | Requests fail with HTTP 403 — the bot logs it and falls back to public mirrors until fixed |
+| Public `rsshub.app` returns HTTP 403 or redirects to a generic 404 | The public instance is refusing the request from this deployment; set `RSSHUB_BASE_URL` to your own RSSHub (and matching `RSSHUB_ACCESS_KEY`) or configure a valid `X_BEARER_TOKEN` |
 | Instance briefly down | Nothing to do — the bot automatically falls back to public RSS mirrors and resumes your instance when it answers |
-| Log shows `Conflict: terminated by other getUpdates` | Two bot instances poll the same token — stop the duplicate: a previous Railway deployment still draining, a second Railway service/replica of this repo, or a local `python twitter_telegram_bot.py` that is still open |
+| Log shows `Conflict: terminated by other getUpdates` | With `DATABASE_URL` or `DATABASE_PUBLIC_URL` configured, replicas now coordinate through a token-specific PostgreSQL advisory lock and only its holder polls. Ensure every replica uses the same database; after upgrading, stop any old deployment or separate service that does not use the lock. Without a database, run exactly one replica; check Railway services and any local `python twitter_telegram_bot.py` process if conflicts persist |
 
 > ⚠️ Reading X through an account cookie is against X's ToS; use a throwaway account you can afford to lose.
 
@@ -255,6 +257,9 @@ twitter-telegram-bot/
 | `MIRROR_BREAKER_COOLDOWN` | `1800` | How long a benched mirror stays out of rotation (seconds); your dedicated RSSHub instance is never benched |
 | `MIRROR_RATE_LIMIT_COOLDOWN` | `120` | Backoff after HTTP 429 (rate limited). A throttled mirror is *alive*, so it gets this short pause instead of the 30-minute bench and does not count toward the failure sample |
 | `CHECK_INTERVAL` | `300` | Check interval (seconds) |
+| `BOT_POLLING_LOCK_RETRY_INTERVAL` | `10` | How often a standby replica retries the PostgreSQL polling lock (seconds) |
+| `BOT_POLLING_LOCK_CHECK_INTERVAL` | `10` | How often the lock holder checks its database session; a lost session stops polling |
+| `BOT_POLLING_CONFLICT_RETRY_INTERVAL` | `60` | Pause after Telegram reports another poller, before retrying |
 | `TRANSLATE_FA` | `true` | Enable Persian translation |
 | `REQUESTY_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY` | empty | AI provider key for higher quality translation |
 | `DASHBOARD_URL` | `http://localhost:8080` | Dashboard URL |

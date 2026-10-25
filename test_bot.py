@@ -4,6 +4,7 @@ import logging
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from database import Database
 from twitter_telegram_bot import (
     TELEGRAM_CAPTION_LIMIT,
     TELEGRAM_TEXT_LIMIT,
@@ -11,6 +12,8 @@ from twitter_telegram_bot import (
     PUBLIC_RSSHUB_BASE_URL,
     _ConflictHintFilter,
     _health_payload,
+    _run_telegram_polling_coordinator,
+    _telegram_polling_lock_id,
     _mirror_mark_failure,
     _mirror_mark_success,
     mirror_health,
@@ -35,6 +38,7 @@ from twitter_telegram_bot import (
     _safe_url_for_log,
     translate_text,
     translation_state,
+    telegram_runtime_state,
     translations_cache,
     utf16_len,
 )
@@ -63,6 +67,12 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
             "feeds_with_data": 0,
             "feeds_without_data": 0,
             "errors": 0,
+        })
+        telegram_runtime_state.update({
+            "state": "starting",
+            "leader": False,
+            "distributed_lock": False,
+            "last_started": None,
         })
 
     def test_utf16_len(self):
@@ -358,6 +368,106 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
         for secret in (access_key, "rss-password"):
             self.assertNotIn(secret, output)
         self.assertIn("[REDACTED]", output)
+
+    def test_database_advisory_lock_uses_a_dedicated_session(self):
+        database = Database.__new__(Database)
+        database.db_url = "postgresql://example/db"
+        connection = MagicMock()
+        connection.closed = 0
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (True,)
+
+        with patch("database.psycopg2.connect", return_value=connection) as connect:
+            acquired = database.try_acquire_advisory_lock(12345)
+
+        self.assertIs(acquired, connection)
+        self.assertTrue(connection.autocommit)
+        connect.assert_called_once_with(
+            "postgresql://example/db",
+            connect_timeout=5,
+            options="-c statement_timeout=5000",
+            keepalives=1,
+        )
+        cursor.execute.assert_called_once_with("SELECT pg_try_advisory_lock(%s)", (12345,))
+        connection.close.assert_not_called()
+
+    def test_database_advisory_lock_closes_session_when_busy(self):
+        database = Database.__new__(Database)
+        database.db_url = "postgresql://example/db"
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (False,)
+
+        with patch("database.psycopg2.connect", return_value=connection):
+            acquired = database.try_acquire_advisory_lock(12345)
+
+        self.assertIsNone(acquired)
+        connection.close.assert_called_once_with()
+
+    def test_database_advisory_lock_release_closes_its_session(self):
+        connection = MagicMock()
+        connection.closed = 0
+        cursor = connection.cursor.return_value.__enter__.return_value
+
+        Database.release_advisory_lock(connection, 12345)
+
+        cursor.execute.assert_called_once_with("SELECT pg_advisory_unlock(%s)", (12345,))
+        connection.close.assert_called_once_with()
+
+    async def test_polling_coordinator_retries_after_lock_is_released(self):
+        stop_event = asyncio.Event()
+        started = asyncio.Event()
+        lock_connection = object()
+        attempts = 0
+
+        def try_lock(_lock_id):
+            nonlocal attempts
+            attempts += 1
+            return None if attempts == 1 else lock_connection
+
+        async def start_bot():
+            started.set()
+            stop_event.set()
+
+        stop_bot = AsyncMock()
+        with (
+            patch("twitter_telegram_bot.db.db_url", "postgresql://shared/db"),
+            patch("twitter_telegram_bot.db.try_acquire_advisory_lock", side_effect=try_lock),
+            patch("twitter_telegram_bot.db.release_advisory_lock") as release_lock,
+            patch("twitter_telegram_bot.BOT_POLLING_LOCK_RETRY_INTERVAL", 0.01),
+            patch("twitter_telegram_bot.BOT_POLLING_LOCK_CHECK_INTERVAL", 0.01),
+        ):
+            await _run_telegram_polling_coordinator(stop_event, start_bot, stop_bot)
+
+        self.assertEqual(attempts, 2)
+        self.assertTrue(started.is_set())
+        stop_bot.assert_awaited_once_with()
+        release_lock.assert_called_once_with(lock_connection, _telegram_polling_lock_id())
+        self.assertEqual(telegram_runtime_state["state"], "stopped")
+
+    async def test_polling_coordinator_stops_when_telegram_reports_conflict(self):
+        stop_event = asyncio.Event()
+        lock_connection = object()
+        conflict_event = asyncio.Event()
+        conflict_event.set()
+
+        async def start_bot():
+            return conflict_event
+
+        async def stop_bot():
+            stop_event.set()
+
+        with (
+            patch("twitter_telegram_bot.db.db_url", "postgresql://shared/db"),
+            patch("twitter_telegram_bot.db.try_acquire_advisory_lock", return_value=lock_connection),
+            patch("twitter_telegram_bot.db.release_advisory_lock") as release_lock,
+            patch("twitter_telegram_bot.BOT_POLLING_CONFLICT_RETRY_INTERVAL", 0.01),
+        ):
+            await _run_telegram_polling_coordinator(stop_event, start_bot, stop_bot)
+
+        release_lock.assert_called_once_with(lock_connection, _telegram_polling_lock_id())
+        self.assertEqual(telegram_runtime_state["state"], "stopped")
+        self.assertFalse(telegram_runtime_state["leader"])
 
     async def test_probe_rsshub_instance_reports_health(self):
         ok = MagicMock(status_code=200)
@@ -752,6 +862,8 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["translation"]["attempts"], 3)
         self.assertEqual(payload["translation"]["successes"], 2)
         self.assertEqual(payload["translation"]["failures"], 1)
+        self.assertIn("polling_state", payload["telegram"])
+        self.assertIn("distributed_lock", payload["telegram"])
         self.assertNotIn("api_key", str(payload["translation"]).lower())
 
     async def test_backfill_timeout_keeps_row_retryable_and_continues(self):
