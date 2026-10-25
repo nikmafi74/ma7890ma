@@ -19,7 +19,7 @@ load_dotenv()
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
-CONCURRENT_LIMIT = 3
+CONCURRENT_LIMIT = 1
 
 REQUESTY_API_KEY = os.getenv("REQUESTY_API_KEY", "").strip()
 REQUESTY_BASE_URL = os.getenv("REQUESTY_BASE_URL", "https://api.17.wtf/v1").strip().rstrip("/")
