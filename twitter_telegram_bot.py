@@ -41,12 +41,6 @@ translations_cache = {}
 
 RSS_SOURCES = [
     "https://nitter.perennialte.ch/{username}/rss",
-    "https://nitter.jaydenha.uk/{username}/rss",
-    "https://nitter.netbub.com/{username}/rss",
-    "https://nitter.kareem.one/{username}/rss",
-    "https://nitter.cz/{username}/rss",
-    "https://nitter.meowing.monster/{username}/rss",
-    "https://nitter.privacydev.net/{username}/rss",
 ]
 RSS_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
 
@@ -133,7 +127,7 @@ async def fetch_feed(username):
     for src in RSS_SOURCES:
         url = src.format(username=username)
         try:
-            resp = await http.get(url, timeout=15, follow_redirects=True)
+            resp = await http.get(url, timeout=20, follow_redirects=True)
             if resp.status_code != 200 or "uni-sonia" in str(resp.url):
                 continue
             feed = await asyncio.to_thread(feedparser.parse, resp.text)
@@ -499,7 +493,7 @@ async def run_cleanup(context):
 @asynccontextmanager
 async def lifespan(fastapi_app):
     global http, bot_app_ref
-    http = httpx.AsyncClient(headers=RSS_HEADERS, timeout=10, follow_redirects=True, limits=httpx.Limits(max_connections=20))
+    http = httpx.AsyncClient(headers=RSS_HEADERS, timeout=20, follow_redirects=True, limits=httpx.Limits(max_connections=20))
 
     from telegram.ext import MessageHandler, filters
 
