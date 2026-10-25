@@ -1,5 +1,5 @@
 import os, asyncio, logging, feedparser, re, httpx, html, hashlib, time, sys
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlunparse
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -112,7 +112,7 @@ else:
 if os.getenv("REQUESTY_MODEL"):
     REQUESTY_MODEL = os.getenv("REQUESTY_MODEL", "").strip()
 elif GEMINI_API_KEY and REQUESTY_API_KEY == GEMINI_API_KEY:
-    REQUESTY_MODEL = "gemini-2.0-flash"
+    REQUESTY_MODEL = "gemini-2.5-flash"
 elif OPENAI_API_KEY and REQUESTY_API_KEY == OPENAI_API_KEY:
     REQUESTY_MODEL = "gpt-4o-mini"
 elif REQUESTY_API_KEY:
@@ -128,13 +128,35 @@ if REQUESTY_API_KEY and not (REQUESTY_BASE_URL and REQUESTY_MODEL):
     REQUESTY_API_KEY = ""
 TRANSLATE_FA = _env_value("TRANSLATE_FA", "true").lower() in ("1", "true", "yes")
 TRANSLATION_TIMEOUT = _env_float("TRANSLATION_TIMEOUT", 20, minimum=1.0)
-TRANSLATION_DELIVERY_TIMEOUT = _env_float("TRANSLATION_DELIVERY_TIMEOUT", 15, minimum=1.0)
+# The overall Telegram delivery budget must allow at least one provider request
+# to reach its own timeout, then leave a short window for a fallback provider.
+TRANSLATION_DELIVERY_TIMEOUT = _env_float(
+    "TRANSLATION_DELIVERY_TIMEOUT",
+    max(30.0, TRANSLATION_TIMEOUT + 5),
+    minimum=1.0,
+)
 TRANSLATION_RETRIES = _env_int("TRANSLATION_RETRIES", 2, minimum=1)
 TRANSLATION_CONCURRENT_LIMIT = _env_int("TRANSLATION_CONCURRENT_LIMIT", 1, minimum=1)
 TRANSLATION_BACKFILL_LIMIT = _env_int("TRANSLATION_BACKFILL_LIMIT", 15, minimum=1)
 MAX_TWEETS_PER_CHECK = _env_int("MAX_TWEETS_PER_CHECK", 10, minimum=1)
 MYMEMORY_SOURCE_LANG = os.getenv("MYMEMORY_SOURCE_LANG", "").strip() or "en"
 MYMEMORY_EMAIL = os.getenv("MYMEMORY_EMAIL", "").strip()
+
+
+def _translation_mode():
+    if not TRANSLATE_FA:
+        return "disabled"
+    if not REQUESTY_API_KEY:
+        return "Google/MyMemory public fallbacks only"
+    host = (urlparse(REQUESTY_BASE_URL).hostname or "custom provider").lower()
+    if host == "generativelanguage.googleapis.com":
+        name = "Gemini"
+    elif host == "api.openai.com":
+        name = "OpenAI"
+    else:
+        name = "OpenAI-compatible provider"
+    return f"{name} ({REQUESTY_MODEL})"
+
 
 # Set LOG_LEVEL=DEBUG to see why each RSS entry was kept or skipped by the retweet filter.
 LOG_LEVEL = (os.getenv("LOG_LEVEL", "INFO") or "INFO").strip().upper()
@@ -202,6 +224,31 @@ logging.getLogger("telegram").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
+if not TRANSLATE_FA:
+    logger.warning("Persian translation is disabled (TRANSLATE_FA=false).")
+elif REQUESTY_API_KEY:
+    logger.info("Persian translation enabled with %s; Google/MyMemory are fallbacks.", _translation_mode())
+else:
+    logger.warning(
+        "No AI translation key is configured; translation relies on public Google/MyMemory fallbacks, "
+        "which may be rate-limited. Set GEMINI_API_KEY or OPENAI_API_KEY for a reliable primary provider."
+    )
+if TRANSLATE_FA and GEMINI_API_KEY and REQUESTY_API_KEY == GEMINI_API_KEY:
+    configured_host = (urlparse(REQUESTY_BASE_URL).hostname or "").lower()
+    if configured_host and configured_host != "generativelanguage.googleapis.com":
+        logger.warning(
+            "GEMINI_API_KEY is paired with a non-Gemini endpoint (%s). Remove REQUESTY_BASE_URL/MODEL "
+            "overrides or set them to a Gemini-compatible endpoint and active model.",
+            configured_host,
+        )
+if TRANSLATION_DELIVERY_TIMEOUT < TRANSLATION_TIMEOUT:
+    logger.warning(
+        "TRANSLATION_DELIVERY_TIMEOUT (%.1fs) is shorter than TRANSLATION_TIMEOUT (%.1fs); "
+        "provider calls may be cancelled before they finish.",
+        TRANSLATION_DELIVERY_TIMEOUT,
+        TRANSLATION_TIMEOUT,
+    )
+
 db = Database()
 if not db.enabled:
     logger.warning("Running without database - /add, /list, dashboard disabled")
@@ -216,6 +263,16 @@ http: httpx.AsyncClient = None
 bot_app_ref = None
 translations_cache = {}
 x_user_id_cache = {}
+translation_state = {
+    "attempts": 0,
+    "successes": 0,
+    "failures": 0,
+    "last_attempt": None,
+    "last_success": None,
+    "last_failure": None,
+    "last_provider": None,
+    "last_failure_reason": None,
+}
 translation_sem = asyncio.Semaphore(max(1, TRANSLATION_CONCURRENT_LIMIT))
 rss_fetch_sem = asyncio.Semaphore(RSS_FETCH_CONCURRENCY)
 
@@ -242,6 +299,15 @@ def build_rsshub_user_feed_url(base_url=None, access_key=None):
     return url
 
 
+def _safe_url_for_log(value):
+    """Remove URL credentials and query values before writing URLs to logs."""
+    parsed = urlparse(str(value or ""))
+    # Basic-auth credentials can appear before @ in netloc; keep only the host.
+    safe_netloc = parsed.netloc.rsplit("@", 1)[-1]
+    safe_query = "[REDACTED]" if parsed.query else ""
+    return urlunparse(parsed._replace(netloc=safe_netloc, query=safe_query, fragment=""))
+
+
 RSS_SOURCES = [
     build_rsshub_user_feed_url(),
     "https://nitter.net/{username}/rss",
@@ -257,7 +323,7 @@ RSS_SOURCES = [
 if RSSHUB_BASE_URL != PUBLIC_RSSHUB_BASE_URL:
     logger.info(
         "Dedicated RSSHub instance configured: %s%s",
-        RSSHUB_BASE_URL,
+        _safe_url_for_log(RSSHUB_BASE_URL),
         " (requests signed with RSSHUB_ACCESS_KEY)" if RSSHUB_ACCESS_KEY else "",
     )
 else:
@@ -723,43 +789,70 @@ async def translate_text(text):
     source_text = text[:3000]
     cache_key = hashlib.md5(source_text.encode()).hexdigest()
 
-    # Never return or retain empty cached translation
+    # Never return or retain empty cached translation.
     if cache_key in translations_cache:
         cached_val = translations_cache[cache_key]
         if cached_val and cached_val.strip():
             return cached_val
         translations_cache.pop(cache_key, None)
 
-    translators = [_translate_with_requesty] if REQUESTY_API_KEY else []
+    translators = [("requesty", _translate_with_requesty)] if REQUESTY_API_KEY else []
     translators.extend([
-        _translate_with_google_endpoint,
-        _translate_with_deep_translator,
-        _translate_with_mymemory,
-        _translate_with_deep_mymemory,
+        ("google_endpoint", _translate_with_google_endpoint),
+        ("deep_translator_google", _translate_with_deep_translator),
+        ("mymemory_api", _translate_with_mymemory),
+        ("deep_translator_mymemory", _translate_with_deep_mymemory),
     ])
 
+    translation_state["attempts"] += 1
+    translation_state["last_attempt"] = datetime.now(timezone.utc).isoformat()
     retries_per_translator = max(1, TRANSLATION_RETRIES)
+    last_failure_reason = "all providers returned an empty response"
 
-    async with translation_sem:
-        for translator in translators:
-            for attempt in range(1, retries_per_translator + 1):
-                try:
-                    result = await translator(source_text)
-                except Exception as e:
-                    logger.warning("%s failed on attempt %s: %s", translator.__name__, attempt, e)
-                    result = ""
-                if result and result.strip():
-                    cleaned = result.strip()
-                    if len(translations_cache) > 500:
-                        translations_cache.clear()
-                    translations_cache[cache_key] = cleaned
-                    return cleaned
-                if attempt < retries_per_translator:
-                    await asyncio.sleep(0.5 * attempt)
+    try:
+        async with translation_sem:
+            for provider, translator in translators:
+                for attempt in range(1, retries_per_translator + 1):
+                    try:
+                        result = await translator(source_text)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        last_failure_reason = f"{provider}: {type(e).__name__}"
+                        logger.warning(
+                            "%s failed on attempt %s (%s)",
+                            translator.__name__,
+                            attempt,
+                            type(e).__name__,
+                        )
+                        result = ""
+                    if result and result.strip():
+                        cleaned = result.strip()
+                        if len(translations_cache) > 500:
+                            translations_cache.clear()
+                        translations_cache[cache_key] = cleaned
+                        translation_state["successes"] += 1
+                        translation_state["last_success"] = datetime.now(timezone.utc).isoformat()
+                        translation_state["last_provider"] = provider
+                        translation_state["last_failure_reason"] = None
+                        return cleaned
+                    last_failure_reason = f"{provider}: empty response"
+                    if attempt < retries_per_translator:
+                        await asyncio.sleep(0.5 * attempt)
+    except asyncio.CancelledError:
+        # build_content cancels this operation at the delivery deadline. Record
+        # it explicitly so /status can distinguish timeouts from disabled translation.
+        translation_state["failures"] += 1
+        translation_state["last_failure"] = datetime.now(timezone.utc).isoformat()
+        translation_state["last_failure_reason"] = "translation cancelled or delivery deadline exceeded"
+        raise
 
-    # Important: do not cache failures / empty results.
-    # A temporary provider outage should not make this tweet permanently untranslated.
-    logger.warning("Translation unavailable after all fallbacks for text: %s", source_text[:120])
+    # Do not cache failures: a temporary provider outage must remain retryable.
+    # Do not put tweet text in logs; provider diagnostics are enough and safer.
+    translation_state["failures"] += 1
+    translation_state["last_failure"] = datetime.now(timezone.utc).isoformat()
+    translation_state["last_failure_reason"] = last_failure_reason
+    logger.warning("Translation unavailable after all fallbacks (%s)", last_failure_reason)
     return ""
 
 
@@ -769,18 +862,46 @@ async def _try_feed_instance(url, target_username):
         async with rss_fetch_sem:
             resp = await http.get(url, timeout=12, follow_redirects=True)
         if resp.status_code == 429:
-            logger.debug("Feed %s -> %s returned HTTP 429 (rate limited)", url, resp.url)
+            logger.debug(
+                "Feed %s -> %s returned HTTP 429 (rate limited)",
+                _safe_url_for_log(url),
+                _safe_url_for_log(resp.url),
+            )
             return _RATE_LIMITED
         if resp.status_code == 404:
-            # A missing/suspended/private account is not evidence that the whole
-            # mirror is down. Do not let one account's 404 bench this host globally.
-            logger.debug("Feed %s -> %s returned HTTP 404 (account-specific miss)", url, resp.url)
+            # A 404 from the original host can be account-specific. A cross-host
+            # redirect ending in 404 (for example rsshub.app -> google.com/404)
+            # means the source itself is broken, so let the circuit breaker see it.
+            requested_host = (urlparse(url).hostname or "").lower()
+            final_host = (urlparse(str(resp.url)).hostname or "").lower()
+            if requested_host and final_host and requested_host != final_host:
+                logger.debug(
+                    "Feed %s redirected from %s to %s and returned HTTP 404 (source failure)",
+                    _safe_url_for_log(url),
+                    requested_host,
+                    final_host,
+                )
+                return None
+            logger.debug(
+                "Feed %s -> %s returned HTTP 404 (account-specific miss)",
+                _safe_url_for_log(url),
+                _safe_url_for_log(resp.url),
+            )
             return _ACCOUNT_NOT_FOUND
         if resp.status_code != 200:
-            logger.debug("Feed %s -> %s returned HTTP %s", url, resp.url, resp.status_code)
+            logger.debug(
+                "Feed %s -> %s returned HTTP %s",
+                _safe_url_for_log(url),
+                _safe_url_for_log(resp.url),
+                resp.status_code,
+            )
             return None
         if "uni-sonia" in str(resp.url):
-            logger.debug("Feed %s -> %s redirected to a challenge page", url, resp.url)
+            logger.debug(
+                "Feed %s -> %s redirected to a challenge page",
+                _safe_url_for_log(url),
+                _safe_url_for_log(resp.url),
+            )
             return None
         feed = await asyncio.to_thread(feedparser.parse, resp.text)
         valid = []
@@ -800,7 +921,11 @@ async def _try_feed_instance(url, target_username):
         if skipped_retweets:
             logger.info("Skipped %s retweets/reposts for @%s", skipped_retweets, target_username)
         if not usable_feed:
-            logger.debug("Feed %s -> %s returned HTTP 200 but no identifiable tweet entries", url, resp.url)
+            logger.debug(
+                "Feed %s -> %s returned HTTP 200 but no identifiable tweet entries",
+                _safe_url_for_log(url),
+                _safe_url_for_log(resp.url),
+            )
             # An empty/changed feed is a per-response data miss, not a server outage.
             # Return [] so the mirror is recorded as reachable but other mirrors are
             # still checked for this account.
@@ -809,9 +934,9 @@ async def _try_feed_instance(url, target_username):
         # still checks the other mirrors and can merge originals from them.
         return valid
     except Exception as e:
-        # Some httpx timeout/connect exceptions stringify to an empty string; include
-        # their type and repr so Railway logs explain why a mirror was unusable.
-        logger.debug("Feed %s failed (%s): %r", url, type(e).__name__, e)
+        # Do not log the exception or raw URL: either may contain a request URL
+        # with the private RSSHub access key in its query string.
+        logger.debug("Feed %s failed (%s)", _safe_url_for_log(url), type(e).__name__)
         return None
 
 
@@ -828,19 +953,29 @@ async def probe_rsshub_instance():
         resp = await http.get(f"{RSSHUB_BASE_URL}/healthz", timeout=5)
     except Exception as e:
         logger.warning(
-            "RSSHub %s did not answer /healthz (%s: %r); feed checks will still try it "
+            "RSSHub %s did not answer /healthz (%s); feed checks will still try it "
             "and fall back to public mirrors.",
-            RSSHUB_BASE_URL,
+            _safe_url_for_log(RSSHUB_BASE_URL),
             type(e).__name__,
-            e,
+        )
+        return
+    configured_host = (urlparse(RSSHUB_BASE_URL).hostname or "").lower()
+    final_host = (urlparse(str(resp.url)).hostname or "").lower()
+    if configured_host and final_host and configured_host != final_host:
+        logger.warning(
+            "RSSHub health check redirected off the configured host (%s -> %s, HTTP %s); "
+            "the configured RSSHub endpoint is not healthy.",
+            configured_host,
+            final_host,
+            resp.status_code,
         )
         return
     if resp.status_code == 200:
-        logger.info("RSSHub %s is up (HTTP 200 on /healthz).", RSSHUB_BASE_URL)
+        logger.info("RSSHub %s is up (HTTP 200 on /healthz).", _safe_url_for_log(RSSHUB_BASE_URL))
     else:
         logger.warning(
             "RSSHub %s answered HTTP %s on /healthz; feeds may fail or be rate-limited.",
-            RSSHUB_BASE_URL,
+            _safe_url_for_log(RSSHUB_BASE_URL),
             resp.status_code,
         )
 
@@ -959,7 +1094,8 @@ def _tweet_id_newest_first_key(tweet_id):
 
 
 def _mirror_host(source):
-    return urlparse(source).netloc
+    # Exclude optional user:password credentials from diagnostic labels.
+    return urlparse(source).netloc.rsplit("@", 1)[-1]
 
 
 def _mirror_is_exempt(source):
@@ -1112,10 +1248,9 @@ async def fetch_feed(username):
                     result = task.result()
                 except Exception as exc:
                     logger.debug(
-                        "Feed task for %s failed (%s): %r",
-                        source,
+                        "Feed task for %s failed (%s)",
+                        _safe_url_for_log(source),
                         type(exc).__name__,
-                        exc,
                     )
                     _mirror_mark_failure(source)
                     failed_mirrors += 1
@@ -1306,7 +1441,7 @@ async def cmd_status(update, context):
     tracked = db.get_all_tracked()
     tweet_count = db._run("SELECT COUNT(*) FROM tweets_content", fetch="one", default=[0])[0] if db.enabled else 0
     missing_translation_count = db.count_missing_translations() if db.enabled else 0
-    ai_status = "✅ AI + Google/MyMemory fallback" if REQUESTY_API_KEY else "⚠️ Google/MyMemory fallback"
+    ai_status = html.escape(_translation_mode())
     db_status = "✅ PostgreSQL" if db.enabled else "❌ غیرفعال"
     if RSSHUB_BASE_URL != PUBLIC_RSSHUB_BASE_URL:
         feed_source = f"✅ RSSHub اختصاصی{' 🔒' if RSSHUB_ACCESS_KEY else ''}"
@@ -1326,11 +1461,31 @@ async def cmd_status(update, context):
         f"⏱ <b>بررسی هر:</b> {CHECK_INTERVAL} ثانیه",
     ]
 
-    if REQUESTY_API_KEY:
-        lines.append(f"🧠 <b>مدل:</b> {REQUESTY_MODEL}")
+    if translation_state["attempts"]:
+        lines.append(
+            f"🔤 <b>ترجمه‌ها:</b> {translation_state['successes']} موفق از "
+            f"{translation_state['attempts']} تلاش، {translation_state['failures']} ناموفق"
+        )
+        if translation_state["last_success"]:
+            lines.append(
+                f"🕒 <b>آخرین ترجمه موفق:</b> "
+                f"{translation_state['last_success'][:16].replace('T', ' ')} UTC "
+                f"({html.escape(str(translation_state['last_provider'] or ''))})"
+            )
+        if translation_state["last_failure_reason"]:
+            lines.append(
+                "⚠️ <b>آخرین نتیجه ترجمه:</b> "
+                f"{html.escape(str(translation_state['last_failure_reason']))}"
+            )
+    else:
+        lines.append("ℹ️ <b>ترجمه:</b> هنوز هیچ تلاش ترجمه‌ای انجام نشده")
 
     if check_state.get("last_finished"):
-        lines.append(f"✅ <b>آخرین بررسی:</b> {check_state['last_finished'][:16].replace('T', ' ')} UTC ({check_state['last_duration']}s، {check_state['errors']} خطا)")
+        lines.append(
+            f"✅ <b>آخرین بررسی:</b> {check_state['last_finished'][:16].replace('T', ' ')} UTC "
+            f"({check_state['last_duration']}s، {check_state['feeds_with_data']} فید دارای داده، "
+            f"{check_state['feeds_without_data']} بدون داده، {check_state['errors']} خطا)"
+        )
 
     total_mirrors, benched_mirrors = _mirror_stats()
     lines.append(f"🔁 <b>آینه‌های فید:</b> {total_mirrors - benched_mirrors} سالم از {total_mirrors}")
@@ -1664,11 +1819,12 @@ async def deliver(content, chat_ids, bot, force=False):
 
 
 async def process_user(username, last_id, bot, sem):
+    """Process one account; return whether its source yielded identifiable feed entries."""
     async with sem:
         entries = await fetch_feed(username)
         await asyncio.sleep(1)
     if not entries:
-        return
+        return False
 
     # Merge may return overlapping items from several mirrors. Deduplicate again here
     # so callers/tests and the X API path receive the same safe processing behavior.
@@ -1678,7 +1834,7 @@ async def process_user(username, last_id, bot, sem):
         if tweet_id:
             all_ids.setdefault(tweet_id, entry)
     if not all_ids:
-        return
+        return False
 
     ordered = sorted(
         all_ids.items(),
@@ -1688,7 +1844,7 @@ async def process_user(username, last_id, bot, sem):
         newest_id = ordered[0][0]
         db.update_last_id(username, newest_id)
         logger.info("Baseline @%s: %s", username, newest_id)
-        return
+        return True
 
     # Process the oldest unseen entries first. If we cap a backlog, advancing the
     # cursor to the newest first would permanently skip the older unprocessed posts.
@@ -1697,11 +1853,11 @@ async def process_user(username, last_id, bot, sem):
         key=lambda item: _tweet_id_sort_key(item[0]),
     )
     if not fresh:
-        return
+        return True
 
     subs = db.get_subs_for_user(username)
     if not subs:
-        return
+        return True
 
     logger.info("@%s: %s new tweets", username, len(fresh))
     batch_limit = max(1, MAX_TWEETS_PER_CHECK)
@@ -1731,15 +1887,18 @@ async def process_user(username, last_id, bot, sem):
             )
             break
         db.update_last_id(username, tweet_id)
+    return True
 
-# Runtime observability for /status and /healthz: when did the last feed check
-# run, how long did it take, and how many accounts errored. Updated by check_updates.
+# Runtime observability for /status and /healthz: completed check timing, accounts
+# with/without identifiable feed data, and processing errors. Updated by check_updates.
 check_state = {
     "running": False,
     "last_started": None,   # UTC ISO timestamp
     "last_finished": None,  # UTC ISO timestamp
     "last_duration": None,  # seconds
     "accounts": 0,
+    "feeds_with_data": 0,
+    "feeds_without_data": 0,
     "errors": 0,
 }
 
@@ -1757,6 +1916,9 @@ async def check_updates(context):
     try:
         tracked = db.get_all_tracked() or []
         check_state["accounts"] = len(tracked)
+        check_state["feeds_with_data"] = 0
+        check_state["feeds_without_data"] = 0
+        check_state["errors"] = 0
         current_feed_scan_accounts = len(tracked)
         check_state["last_started"] = datetime.now(timezone.utc).isoformat()
         if not tracked:
@@ -1778,13 +1940,20 @@ async def check_updates(context):
                     result,
                     exc_info=(type(result), result, result.__traceback__),
                 )
+        feeds_with_data = sum(result is True for result in results)
+        feeds_without_data = sum(result is False for result in results)
 
         logger.info(
-            "Feed check finished in %.1f seconds (%s accounts, %s errors).",
+            "Feed check finished in %.1f seconds (%s accounts; %s with feed data, "
+            "%s without identifiable data, %s errors).",
             time.monotonic() - started_at,
             len(tracked),
+            feeds_with_data,
+            feeds_without_data,
             failures,
         )
+        check_state["feeds_with_data"] = feeds_with_data
+        check_state["feeds_without_data"] = feeds_without_data
         check_state["errors"] = failures
     except Exception:
         logger.exception("Feed check crashed")
@@ -1807,7 +1976,20 @@ async def run_translation_backfill(context):
         return
     logger.info("Backfilling translations for %s saved tweets (DB/dashboard only)", len(rows))
     for row in rows:
-        translation = await translate_text(row["title"])
+        try:
+            translation = await asyncio.wait_for(
+                translate_text(row["title"]),
+                timeout=TRANSLATION_DELIVERY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Backfill translation timed out for saved tweet %s; it will be retried next cycle",
+                row["id"],
+            )
+            translation = ""
+        except Exception:
+            logger.exception("Backfill translation failed for saved tweet %s", row["id"])
+            translation = ""
         if translation and translation.strip():
             db.update_tweet_translation(row["id"], translation.strip())
         await asyncio.sleep(0.4)
@@ -1902,14 +2084,34 @@ app = FastAPI(lifespan=lifespan)
 def _health_payload():
     """Fine for uptime monitors; 503 only when a hard dependency is unusable."""
     ok = bool(TOKEN) and (db.enabled or not (os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")))
+    total_mirrors, benched_mirrors = _mirror_stats()
     return {
         "ok": ok,
         "database": "ok" if db.enabled else "disabled",
         "feed_source": "dedicated-rsshub" if RSSHUB_BASE_URL != PUBLIC_RSSHUB_BASE_URL else "public-mirrors",
         "x_api": bool(X_BEARER_TOKEN),
         "check_interval": CHECK_INTERVAL,
-        "mirrors": {"total": _mirror_stats()[0], "benched": _mirror_stats()[1]},
-        "last_check": {k: check_state[k] for k in ("running", "last_started", "last_finished", "last_duration", "accounts", "errors")},
+        "mirrors": {"total": total_mirrors, "benched": benched_mirrors},
+        "translation": {
+            "enabled": TRANSLATE_FA,
+            "mode": _translation_mode(),
+            "attempts": translation_state["attempts"],
+            "successes": translation_state["successes"],
+            "failures": translation_state["failures"],
+            "last_attempt": translation_state["last_attempt"],
+            "last_success": translation_state["last_success"],
+            "last_failure": translation_state["last_failure"],
+            "last_provider": translation_state["last_provider"],
+            "last_failure_reason": translation_state["last_failure_reason"],
+            "delivery_timeout": TRANSLATION_DELIVERY_TIMEOUT,
+        },
+        "last_check": {
+            k: check_state[k]
+            for k in (
+                "running", "last_started", "last_finished", "last_duration",
+                "accounts", "feeds_with_data", "feeds_without_data", "errors",
+            )
+        },
     }
 
 

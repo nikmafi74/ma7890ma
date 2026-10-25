@@ -10,12 +10,15 @@ from twitter_telegram_bot import (
     RSS_SOURCES,
     PUBLIC_RSSHUB_BASE_URL,
     _ConflictHintFilter,
+    _health_payload,
     _mirror_mark_failure,
     _mirror_mark_success,
     mirror_health,
     build_content,
     build_message,
     build_rsshub_user_feed_url,
+    check_state,
+    check_updates,
     deliver,
     escape_and_truncate,
     extract_author_username,
@@ -29,7 +32,9 @@ from twitter_telegram_bot import (
     probe_rsshub_instance,
     process_user,
     run_translation_backfill,
+    _safe_url_for_log,
     translate_text,
+    translation_state,
     translations_cache,
     utf16_len,
 )
@@ -39,6 +44,26 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         translations_cache.clear()
         mirror_health.clear()
+        translation_state.update({
+            "attempts": 0,
+            "successes": 0,
+            "failures": 0,
+            "last_attempt": None,
+            "last_success": None,
+            "last_failure": None,
+            "last_provider": None,
+            "last_failure_reason": None,
+        })
+        check_state.update({
+            "running": False,
+            "last_started": None,
+            "last_finished": None,
+            "last_duration": None,
+            "accounts": 0,
+            "feeds_with_data": 0,
+            "feeds_without_data": 0,
+            "errors": 0,
+        })
 
     def test_utf16_len(self):
         self.assertEqual(utf16_len("hello"), 5)
@@ -311,6 +336,29 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
             "http://rsshub:1200/twitter/user/{username}",
         )
 
+    def test_safe_url_for_log_redacts_query_and_userinfo(self):
+        private_url = "https://rss-user:rss-password@rss.example.org:1200/feed?key=top-secret&other=value#section"
+        safe_url = _safe_url_for_log(private_url)
+
+        self.assertEqual(safe_url, "https://rss.example.org:1200/feed?[REDACTED]")
+        for secret in ("rss-user", "rss-password", "top-secret", "other=value", "section"):
+            self.assertNotIn(secret, safe_url)
+
+    async def test_feed_error_logs_redact_rsshub_access_key(self):
+        access_key = "private-rss-access-key"
+        url = f"https://rss-user:rss-password@rss.example.org/feed?key={access_key}"
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=ConnectionError(f"connection to {url} failed"))
+
+        with patch("twitter_telegram_bot.http", client), self.assertLogs("twitter_telegram_bot", level="DEBUG") as captured:
+            result = await _try_feed_instance(url, "user")
+
+        self.assertIsNone(result)
+        output = "\n".join(captured.output)
+        for secret in (access_key, "rss-password"):
+            self.assertNotIn(secret, output)
+        self.assertIn("[REDACTED]", output)
+
     async def test_probe_rsshub_instance_reports_health(self):
         ok = MagicMock(status_code=200)
         client = MagicMock()
@@ -470,6 +518,37 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(entries, [])
         self.assertEqual(cancelled, 2)
+
+    async def test_process_user_reports_missing_feed_data(self):
+        with patch("twitter_telegram_bot.fetch_feed", new=AsyncMock(return_value=[])), \
+             patch("twitter_telegram_bot.asyncio.sleep", new=AsyncMock()):
+            result = await process_user("user", "1000", MagicMock(), asyncio.Semaphore(1))
+
+        self.assertFalse(result)
+
+    async def test_check_updates_reports_empty_feeds_separately_from_errors(self):
+        mock_db = MagicMock()
+        mock_db.get_all_tracked.return_value = [
+            ("has_data", "1"),
+            ("empty", "1"),
+            ("error", "1"),
+        ]
+
+        async def process(username, *_args):
+            if username == "error":
+                raise RuntimeError("unexpected processing error")
+            return username == "has_data"
+
+        context = MagicMock()
+        context.application.bot = MagicMock()
+        with patch("twitter_telegram_bot.db", mock_db), \
+             patch("twitter_telegram_bot.process_user", new=AsyncMock(side_effect=process)):
+            await check_updates(context)
+
+        self.assertEqual(check_state["feeds_with_data"], 1)
+        self.assertEqual(check_state["feeds_without_data"], 1)
+        self.assertEqual(check_state["errors"], 1)
+        self.assertFalse(check_state["running"])
 
     async def test_process_user_batches_oldest_unseen_posts_without_skipping(self):
         entries = [
@@ -634,6 +713,9 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
                             res = await translate_text("Some text that cannot be translated")
                             self.assertEqual(res, "")
                             self.assertEqual(len(translations_cache), 0)
+                            self.assertEqual(translation_state["attempts"], 1)
+                            self.assertEqual(translation_state["failures"], 1)
+                            self.assertIsNotNone(translation_state["last_failure_reason"])
 
     async def test_successful_translation_cached(self):
         """Valid translation is cached."""
@@ -642,9 +724,50 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
                 res = await translate_text("A test tweet")
                 self.assertEqual(res, "ترجمه تستی")
                 self.assertGreater(len(translations_cache), 0)
-                # Second call should return from cache
+                self.assertEqual(translation_state["attempts"], 1)
+                self.assertEqual(translation_state["successes"], 1)
+                self.assertEqual(translation_state["last_provider"], "requesty")
+                # Second call should return from cache without another provider attempt.
                 res2 = await translate_text("A test tweet")
                 self.assertEqual(res2, "ترجمه تستی")
+                self.assertEqual(translation_state["attempts"], 1)
+
+    def test_health_payload_exposes_translation_status_without_credentials(self):
+        translation_state.update({
+            "attempts": 3,
+            "successes": 2,
+            "failures": 1,
+            "last_attempt": "2026-10-25T08:00:00+00:00",
+            "last_success": "2026-10-25T07:59:00+00:00",
+            "last_failure": "2026-10-25T08:00:00+00:00",
+            "last_provider": "google_endpoint",
+            "last_failure_reason": "google_endpoint: empty response",
+        })
+        with patch("twitter_telegram_bot.TRANSLATE_FA", True), \
+             patch("twitter_telegram_bot.REQUESTY_API_KEY", ""):
+            payload = _health_payload()
+
+        self.assertTrue(payload["translation"]["enabled"])
+        self.assertEqual(payload["translation"]["mode"], "Google/MyMemory public fallbacks only")
+        self.assertEqual(payload["translation"]["attempts"], 3)
+        self.assertEqual(payload["translation"]["successes"], 2)
+        self.assertEqual(payload["translation"]["failures"], 1)
+        self.assertNotIn("api_key", str(payload["translation"]).lower())
+
+    async def test_backfill_timeout_keeps_row_retryable_and_continues(self):
+        rows = [
+            {"id": 41, "username": "one", "title": "slow tweet", "tweet_link": ""},
+            {"id": 42, "username": "two", "title": "fast tweet", "tweet_link": ""},
+        ]
+        with patch("twitter_telegram_bot.db") as mock_db, \
+             patch("twitter_telegram_bot.TRANSLATION_DELIVERY_TIMEOUT", 0.01), \
+             patch("twitter_telegram_bot.translate_text", new=AsyncMock(side_effect=[asyncio.TimeoutError(), "ترجمه"])), \
+             patch("twitter_telegram_bot.asyncio.sleep", new=AsyncMock()):
+            mock_db.enabled = True
+            mock_db.get_tweets_missing_translation.return_value = rows
+            await run_translation_backfill(MagicMock())
+
+        mock_db.update_tweet_translation.assert_called_once_with(42, "ترجمه")
 
     async def test_backfill_does_not_send_telegram_message(self):
         """run_translation_backfill only updates DB and sends NO Telegram messages."""
@@ -729,6 +852,21 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
         # must skip breaker-a entirely.
         self.assertEqual(len([u for u in calls if "breaker-a" in u]), 2)
         self.assertEqual(len([u for u in calls if "breaker-b" in u]), 3)
+
+    async def test_cross_host_404_redirect_is_a_source_failure(self):
+        """A redirect to a generic 404 page must not be mistaken for a missing account."""
+        client = MagicMock()
+        client.get = AsyncMock(return_value=MagicMock(
+            status_code=404,
+            url="https://www.google.com/404",
+        ))
+        with patch("twitter_telegram_bot.http", client):
+            result = await _try_feed_instance(
+                "https://rsshub.app/twitter/user/user",
+                "user",
+            )
+
+        self.assertIsNone(result)
 
     async def test_account_404_does_not_bench_the_mirror_for_other_users(self):
         """A 404 may be user-specific and must not mark the whole mirror dead."""
