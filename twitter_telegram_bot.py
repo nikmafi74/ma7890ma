@@ -69,12 +69,10 @@ RSS_FETCH_CONCURRENCY = _env_int("RSS_FETCH_CONCURRENCY", 12, minimum=1)
 # Bound every account's mirror sweep and only wait briefly to merge other fast replies.
 RSS_FETCH_TIMEOUT = _env_float("RSS_FETCH_TIMEOUT", 12, minimum=1.0)
 RSS_MERGE_GRACE = _env_float("RSS_MERGE_GRACE", 0.25, minimum=0.0)
-# Circuit breaker for feed mirrors: most public mirrors are permanently dead
-# (DNS gone, HTTP 403/410/451). Every tracked account used to hit every dead
-# mirror on every check. A mirror is benched after N CONSECUTIVE hard failures
-# — N must be large enough (≫ accounts probed in one round) that a mirror
-# which serves most accounts is not benched on a bad streak for a few of them
-# — for a cooldown, then re-probed in case it came back.
+# Circuit breaker for feed mirrors. Per-account 404s and successful-but-empty
+# timelines are not host failures. During a scheduled batch, require at least two
+# full tracked-account passes of hard failures before benching a host, so a few
+# bad responses early in a large sweep cannot take it out for everyone.
 MIRROR_BREAKER_SAMPLE = _env_int("MIRROR_BREAKER_SAMPLE", 12, minimum=2)
 MIRROR_BREAKER_COOLDOWN = _env_int("MIRROR_BREAKER_COOLDOWN", 1800, minimum=60)
 # HTTP 429 means "alive but throttled", NOT dead. Back such a mirror off briefly
@@ -82,9 +80,11 @@ MIRROR_BREAKER_COOLDOWN = _env_int("MIRROR_BREAKER_COOLDOWN", 1800, minimum=60)
 # is never benched for half an hour and our own bursts stop making it worse.
 MIRROR_RATE_LIMIT_COOLDOWN = _env_int("MIRROR_RATE_LIMIT_COOLDOWN", 120, minimum=10)
 mirror_health = {}  # host -> {"fails": int, "tripped_until": monotonic ts}
-# Sentinel returned by _try_feed_instance on HTTP 429 so fetch_feed can tell
-# "throttled" apart from "dead".
+current_feed_scan_accounts = 0
+# Sentinels keep HTTP 429/404 responses distinct from hard failures that can
+# contribute to a host-wide breaker trip.
 _RATE_LIMITED = object()
+_ACCOUNT_NOT_FOUND = object()
 
 PLACEHOLDER_API_KEYS = {"key", "your_key", "your_api_key", "your_gemini_api_key", "your_requesty_or_gemini_key"}
 
@@ -764,13 +764,18 @@ async def translate_text(text):
 
 
 async def _try_feed_instance(url, target_username):
-    """Fetch and parse one RSS source. Returns valid entries or None."""
+    """Fetch and parse one RSS source. Return entries, [] for an empty 200, or a sentinel/error."""
     try:
         async with rss_fetch_sem:
             resp = await http.get(url, timeout=12, follow_redirects=True)
         if resp.status_code == 429:
             logger.debug("Feed %s -> %s returned HTTP 429 (rate limited)", url, resp.url)
             return _RATE_LIMITED
+        if resp.status_code == 404:
+            # A missing/suspended/private account is not evidence that the whole
+            # mirror is down. Do not let one account's 404 bench this host globally.
+            logger.debug("Feed %s -> %s returned HTTP 404 (account-specific miss)", url, resp.url)
+            return _ACCOUNT_NOT_FOUND
         if resp.status_code != 200:
             logger.debug("Feed %s -> %s returned HTTP %s", url, resp.url, resp.status_code)
             return None
@@ -796,9 +801,13 @@ async def _try_feed_instance(url, target_username):
             logger.info("Skipped %s retweets/reposts for @%s", skipped_retweets, target_username)
         if not usable_feed:
             logger.debug("Feed %s -> %s returned HTTP 200 but no identifiable tweet entries", url, resp.url)
-        # Keep an all-reposts feed distinguishable from a failed/empty endpoint. The
-        # caller still checks the other mirrors and can merge originals from them.
-        return valid if usable_feed else None
+            # An empty/changed feed is a per-response data miss, not a server outage.
+            # Return [] so the mirror is recorded as reachable but other mirrors are
+            # still checked for this account.
+            return []
+        # Keep an all-reposts feed distinguishable from an empty endpoint. The caller
+        # still checks the other mirrors and can merge originals from them.
+        return valid
     except Exception as e:
         # Some httpx timeout/connect exceptions stringify to an empty string; include
         # their type and repr so Railway logs explain why a mirror was unusable.
@@ -972,13 +981,18 @@ def _mirror_mark_failure(source):
         return
     record = mirror_health.setdefault(host, {"fails": 0, "tripped_until": 0.0})
     record["fails"] += 1
-    if record["fails"] >= MIRROR_BREAKER_SAMPLE:
+    # MIRROR_BREAKER_SAMPLE is the floor. During the regular sweep, scale the
+    # threshold with the account count so a few failures early in a 79-account
+    # pass cannot bench a mirror before its other feeds have been tried.
+    threshold = max(MIRROR_BREAKER_SAMPLE, current_feed_scan_accounts * 2)
+    if record["fails"] >= threshold:
         record["tripped_until"] = time.monotonic() + MIRROR_BREAKER_COOLDOWN
         logger.info(
-            "Mirror %s benched for %ss after %s consecutive failures",
+            "Mirror %s benched for %ss after %s consecutive hard failures (threshold %s)",
             host,
             MIRROR_BREAKER_COOLDOWN,
             record["fails"],
+            threshold,
         )
 
 
@@ -1066,7 +1080,10 @@ async def fetch_feed(username):
     }
     pending = set(task_sources)
     feed_results = []
-    usable_mirrors = 0
+    reachable_mirrors = 0
+    failed_mirrors = 0
+    rate_limited_mirrors = 0
+    account_not_found_mirrors = 0
     first_post_deadline = None
     loop = asyncio.get_running_loop()
     overall_deadline = loop.time() + RSS_FETCH_TIMEOUT
@@ -1101,15 +1118,24 @@ async def fetch_feed(username):
                         exc,
                     )
                     _mirror_mark_failure(source)
+                    failed_mirrors += 1
                     continue
                 if result is _RATE_LIMITED:
                     _mirror_mark_rate_limited(source)
+                    rate_limited_mirrors += 1
+                    continue
+                if result is _ACCOUNT_NOT_FOUND:
+                    # The host answered, so this also clears any previous hard
+                    # failure streak; the miss belongs to this username only.
+                    _mirror_mark_success(source)
+                    account_not_found_mirrors += 1
                     continue
                 if result is None:
                     _mirror_mark_failure(source)
+                    failed_mirrors += 1
                     continue
                 _mirror_mark_success(source)
-                usable_mirrors += 1
+                reachable_mirrors += 1
                 if result:
                     feed_results.append(result)
                     if first_post_deadline is None:
@@ -1127,24 +1153,29 @@ async def fetch_feed(username):
 
         if not merged and pending:
             logger.warning(
-                "RSS fetch for @%s hit its %.1fs deadline (%s/%s mirrors returned; "
+                "RSS fetch for @%s hit its %.1fs deadline (%s/%s mirrors responded; "
                 "none produced original posts).",
                 target_username,
                 RSS_FETCH_TIMEOUT,
-                usable_mirrors,
+                reachable_mirrors,
                 len(sources),
             )
-        elif not merged and not usable_mirrors:
+        elif not merged and not reachable_mirrors:
             logger.warning(
-                "No usable RSS feed for @%s: all %s mirrors failed or returned empty data.",
+                "No usable RSS feed for @%s (%s server/network failures, %s rate-limited, "
+                "%s account-specific 404s).",
                 target_username,
-                len(sources),
+                failed_mirrors,
+                rate_limited_mirrors,
+                account_not_found_mirrors,
             )
         elif not merged:
             logger.info(
-                "RSS feeds for @%s were reachable, but no original posts were found; "
-                "reposts are filtered.",
+                "RSS sources for @%s responded, but none returned identifiable original posts "
+                "(%s reachable, %s account-specific 404s).",
                 target_username,
+                reachable_mirrors,
+                account_not_found_mirrors,
             )
         else:
             logger.debug(
@@ -1714,6 +1745,7 @@ check_state = {
 
 
 async def check_updates(context):
+    global current_feed_scan_accounts
     # PTB's run_repeating schedules the next run regardless of whether the
     # previous one finished: a slow check (dead feed, stalled translation) would
     # overlap with the next one and duplicate Telegram sends. Skip instead.
@@ -1725,6 +1757,7 @@ async def check_updates(context):
     try:
         tracked = db.get_all_tracked() or []
         check_state["accounts"] = len(tracked)
+        current_feed_scan_accounts = len(tracked)
         check_state["last_started"] = datetime.now(timezone.utc).isoformat()
         if not tracked:
             logger.info("Update check finished: no tracked accounts in the database.")
@@ -1762,6 +1795,7 @@ async def check_updates(context):
         duration = time.monotonic() - started_at
         check_state["last_finished"] = datetime.now(timezone.utc).isoformat()
         check_state["last_duration"] = round(duration, 1)
+        current_feed_scan_accounts = 0
         check_state["running"] = False
 
 

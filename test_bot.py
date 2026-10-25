@@ -730,6 +730,48 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len([u for u in calls if "breaker-a" in u]), 2)
         self.assertEqual(len([u for u in calls if "breaker-b" in u]), 3)
 
+    async def test_account_404_does_not_bench_the_mirror_for_other_users(self):
+        """A 404 may be user-specific and must not mark the whole mirror dead."""
+        calls = []
+
+        async def get(url, **_kwargs):
+            calls.append(url)
+            return MagicMock(status_code=404, url=url)
+
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=get)
+        source = "https://per-user-404.example/{username}/rss"
+        with patch("twitter_telegram_bot.RSS_SOURCES", [source]), \
+             patch("twitter_telegram_bot.X_BEARER_TOKEN", ""), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_SAMPLE", 1), \
+             patch("twitter_telegram_bot.http", client):
+            await fetch_feed("missing_one")
+            await fetch_feed("missing_two")
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(mirror_health["per-user-404.example"], {"fails": 0, "tripped_until": 0.0})
+
+    async def test_empty_http_200_does_not_bench_a_reachable_mirror(self):
+        """An empty/changed feed is a data miss, not a host outage."""
+        calls = []
+
+        async def get(url, **_kwargs):
+            calls.append(url)
+            return MagicMock(status_code=200, text="<html>temporarily empty</html>", url=url)
+
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=get)
+        source = "https://empty-feed.example/{username}/rss"
+        with patch("twitter_telegram_bot.RSS_SOURCES", [source]), \
+             patch("twitter_telegram_bot.X_BEARER_TOKEN", ""), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_SAMPLE", 1), \
+             patch("twitter_telegram_bot.http", client):
+            await fetch_feed("user_one")
+            await fetch_feed("user_two")
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(mirror_health["empty-feed.example"], {"fails": 0, "tripped_until": 0.0})
+
     async def test_circuit_breaker_never_blinds_all_mirrors(self):
         """When every mirror is benched, the soonest one is still probed."""
         calls = []
@@ -823,6 +865,20 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
             await fetch_feed("user")
 
         self.assertEqual(len(calls), 2)
+
+    def test_breaker_threshold_scales_with_tracked_account_count(self):
+        """A single bad RSS sweep cannot trip a host-wide cooldown."""
+        host = "https://large-sweep.example/{username}/rss"
+        with patch("twitter_telegram_bot.MIRROR_BREAKER_SAMPLE", 12), \
+             patch("twitter_telegram_bot.MIRROR_BREAKER_COOLDOWN", 10**9), \
+             patch("twitter_telegram_bot.current_feed_scan_accounts", 79):
+            for _ in range(157):
+                _mirror_mark_failure(host)
+            self.assertEqual(mirror_health["large-sweep.example"]["tripped_until"], 0.0)
+            _mirror_mark_failure(host)
+
+        self.assertGreater(mirror_health["large-sweep.example"]["tripped_until"], 0)
+        self.assertEqual(mirror_health["large-sweep.example"]["fails"], 158)
 
     def test_mirror_breaker_resets_on_success(self):
         """SAMPLE hard failures bench a mirror; one success clears it again."""
