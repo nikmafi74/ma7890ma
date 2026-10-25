@@ -68,12 +68,14 @@ DATABASE_URL=postgresql://user:pass@localhost:5432/dbname
 # Optional: use another RSSHub instance
 # RSSHUB_BASE_URL=https://rsshub.app
 
-# AI Translation (optional)
+# Persian translation (enabled by default)
 TRANSLATE_FA=true
-# You can use REQUESTY_API_KEY or GEMINI_API_KEY
-REQUESTY_API_KEY=your_gemini_api_key
-REQUESTY_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
-REQUESTY_MODEL=gemini-2.0-flash
+# Recommended: use a Gemini key; the app selects the compatible endpoint/model.
+GEMINI_API_KEY=your_gemini_api_key
+# Or use an OpenAI-compatible provider, setting all three:
+# REQUESTY_API_KEY=your_provider_key
+# REQUESTY_BASE_URL=https://provider.example/v1
+# REQUESTY_MODEL=your_active_model
 ```
 
 `X_BEARER_TOKEN` is optional. Without it, the bot tries the public RSSHub route (`https://rsshub.app/twitter/user/<username>`) and other RSS mirrors; these public services can be rate-limited or unavailable. If you have X API read access, set its Bearer Token in your host's secrets (never commit or paste it). For a reliable token-free setup, deploy a **dedicated RSSHub** (next section) and point `RSSHUB_BASE_URL` at it.
@@ -202,10 +204,11 @@ Searches saved tweets and shares them inline.
 | `X_BEARER_TOKEN` | Optional Bearer Token with X API read access; otherwise RSSHub/RSS mirrors are used |
 | `RSSHUB_BASE_URL` | Your dedicated RSSHub URL (recommended — see [Dedicated RSSHub](#-dedicated-rsshub--reliable-feeds-no-x-api-token)); defaults to `https://rsshub.app` |
 | `RSSHUB_ACCESS_KEY` | Must match the RSSHub instance's `ACCESS_KEY`, if you set one |
-| `REQUESTY_API_KEY` | Your Gemini key |
-| `REQUESTY_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` |
-| `REQUESTY_MODEL` | `gemini-2.0-flash` |
-| `TRANSLATE_FA` | `true` |
+| `GEMINI_API_KEY` | Optional Gemini key for reliable primary translation; defaults to the current configured Gemini endpoint/model |
+| `TRANSLATE_FA` | `true` | Enable Persian translation (default) |
+| `TRANSLATION_DELIVERY_TIMEOUT` | `30` | Translation budget before sending the original post |
+
+For a different OpenAI-compatible AI provider, set `REQUESTY_API_KEY`, `REQUESTY_BASE_URL`, and `REQUESTY_MODEL` together. Do not point a Gemini key at the OpenAI API endpoint.
 
 Tip: add the RSSHub as a **second service in the same Railway project** (New → GitHub Repo → `DIYgod/RSSHub`, variables `NODE_ENV`, `TWITTER_AUTH_TOKEN`, `ACCESS_KEY`) and point `RSSHUB_BASE_URL` at its generated domain — no X API token needed anywhere.
 
@@ -258,7 +261,7 @@ twitter-telegram-bot/
 | `CONCURRENT_LIMIT` | `3` | Number of accounts checked concurrently |
 | `RSS_FETCH_CONCURRENCY` | `12` | Global cap on concurrent RSS HTTP requests (helps prevent connection-pool timeouts) |
 | `TRANSLATION_TIMEOUT` | `20` | Timeout per translation attempt (seconds) |
-| `TRANSLATION_DELIVERY_TIMEOUT` | `15` | Maximum wait for translation before sending the original post |
+| `TRANSLATION_DELIVERY_TIMEOUT` | `30` | Maximum wait for translation before sending the original post; default is longer than one provider request timeout so it can finish or fall back |
 | `TRANSLATION_RETRIES` | `2` | Retries for the primary AI/Google translation attempts |
 | `TRANSLATION_CONCURRENT_LIMIT` | `1` | Parallel translation calls (keep low to avoid Google rate limits) |
 | `TRANSLATION_BACKFILL_LIMIT` | `15` | Saved untranslated tweets repaired per backfill run |

@@ -51,12 +51,14 @@ DATABASE_URL=آدرس PostgreSQL
 # RSSHUB_BASE_URL=https://rsshub.app
 # اختیاری: اگر روی RSSHub خودت متغیر ACCESS_KEY گذاشتی، همین مقدار را اینجا هم بگذار
 # RSSHUB_ACCESS_KEY=
-# ترجمه فارسی (اختیاری)
+# ترجمه فارسی (به‌صورت پیش‌فرض فعال است)
 TRANSLATE_FA=true
-# می‌تونی REQUESTY_API_KEY یا GEMINI_API_KEY استفاده کنی
-REQUESTY_API_KEY=your_requesty_or_gemini_key
-REQUESTY_BASE_URL=https://api.openai.com/v1
-REQUESTY_MODEL=gpt-4o-mini
+# پیشنهاد: فقط کلید Gemini را بگذار؛ برنامه endpoint/model را خودش انتخاب می‌کند
+GEMINI_API_KEY=your_gemini_api_key
+# برای سرویس OpenAI-compatible دیگر، هر سه مقدار را متناسب با همان سرویس بگذار:
+# REQUESTY_API_KEY=your_provider_key
+# REQUESTY_BASE_URL=https://provider.example/v1
+# REQUESTY_MODEL=your_active_model
 ```
 
 `X_BEARER_TOKEN` اجباری نیست؛ بدون آن ربات از RSSHub عمومی (`https://rsshub.app/twitter/user/<username>`) و سپس آینه‌های دیگر استفاده می‌کند. این سرویس‌های عمومی ممکن است محدود یا قطع شوند. راه پایدار و بدون توکن: **RSSHub اختصاصی** (بخش «🛰 RSSHub اختصاصی» در پایین همین متن). اگر X API داری، می‌توانی Bearer Token را در Railway Variables تنظیم کنی؛ هرگز آن را در چت یا Git قرار نده. برای استفاده از RSSHub دیگری، `RSSHUB_BASE_URL` را تغییر بده.
@@ -93,7 +95,8 @@ python twitter_telegram_bot.py
 2. PostgreSQL دیتابیس اضافه کن
 3. متغیر `DATABASE_URL` خودکار ست میشه
 4. در Variables سرویس، `TELEGRAM_BOT_TOKEN` را تنظیم کن. `X_BEARER_TOKEN` اختیاری است؛ بدون آن ربات RSSHub و RSSهای عمومی را امتحان می‌کند.
-5. (پیشنهادی) یک سرویس RSSHub هم **داخل همین پروژه** اضافه کن: **New → GitHub Repo → `DIYgod/RSSHub`** با متغیرهای `NODE_ENV`، `TWITTER_AUTH_TOKEN` و `ACCESS_KEY`، بعد در ربات `RSSHUB_BASE_URL` و `RSSHUB_ACCESS_KEY` را ست کن — بدون هیچ X API.
+5. برای ترجمهٔ مطمئن‌تر، `TRANSLATE_FA=true` و `GEMINI_API_KEY` معتبر را بگذار. بدون کلید، برنامه از Google/MyMemory عمومی استفاده می‌کند که ممکن است روی Railway محدود یا مسدود شود. اگر از Gemini استفاده می‌کنی، متغیرهای `REQUESTY_BASE_URL` یا `REQUESTY_MODEL` قدیمی/متناقض را پاک کن تا تنظیم خودکار اعمال شود.
+6. (پیشنهادی) یک سرویس RSSHub هم **داخل همین پروژه** اضافه کن: **New → GitHub Repo → `DIYgod/RSSHub`** با متغیرهای `NODE_ENV`، `TWITTER_AUTH_TOKEN` و `ACCESS_KEY`، بعد در ربات `RSSHUB_BASE_URL` و `RSSHUB_ACCESS_KEY` را ست کن — بدون هیچ X API.
 
 ---
 
@@ -187,7 +190,7 @@ curl "https://<آدرس-rsshub>/twitter/user/nasa?key=<ACCESS_KEY>"
 | `CONCURRENT_LIMIT` | `3` | تعداد حساب‌هایی که هم‌زمان بررسی می‌شوند |
 | `RSS_FETCH_CONCURRENCY` | `12` | سقف کلی درخواست‌های هم‌زمان RSS برای جلوگیری از PoolTimeout |
 | `TRANSLATION_TIMEOUT` | `20` | تایم‌اوت هر تلاش ترجمه (ثانیه) |
-| `TRANSLATION_DELIVERY_TIMEOUT` | `15` | حداکثر انتظار برای ترجمه؛ بعدش متن اصلی ارسال می‌شود |
+| `TRANSLATION_DELIVERY_TIMEOUT` | `30` | حداکثر انتظار برای ترجمه؛ بعدش متن اصلی ارسال می‌شود. مقدار پیش‌فرض از تایم‌اوت یک تلاشِ provider بیشتر است تا فرصت ترجمه یا fallback داشته باشد |
 | `TRANSLATION_RETRIES` | `2` | تعداد تلاش دوباره برای تلاش‌های اصلی AI/Google |
 | `TRANSLATION_CONCURRENT_LIMIT` | `1` | تعداد ترجمه همزمان (برای جلوگیری از محدودیت گوگل کم نگه دار) |
 | `TRANSLATION_BACKFILL_LIMIT` | `15` | تعداد توییت‌های بدون ترجمه که در هر نوبت ترمیم می‌شوند |
