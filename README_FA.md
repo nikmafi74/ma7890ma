@@ -155,6 +155,7 @@ curl "https://<آدرس-rsshub>/twitter/user/nasa?key=<ACCESS_KEY>"
 
 - اگر XML توییت‌ها را برگرداند → درست است.
 - لاگ شروع ربات باید بنویسد: `RSSHub <url> is up (HTTP 200 on /healthz)`.
+- در `GET /healthz` باید `telegram.polling_state: "polling"` دیده شود؛ replica با وضعیت `"standby"` منتظر lock دیتابیس مشترک است.
 - در تلگرام `/status` بفرست → باید `📡 منبع فید: ✅ RSSHub اختصاصی` ببینی.
 
 ### رفع اشکال
@@ -164,8 +165,9 @@ curl "https://<آدرس-rsshub>/twitter/user/nasa?key=<ACCESS_KEY>"
 | فید می‌گوید `Twitter authentication cookie is not valid` | کوکی منقضی/عوض شده — دوباره وارد شو و `TWITTER_AUTH_TOKEN` را آپدیت کن (تغییر رمز یا Log out کوکی را باطل می‌کند) |
 | سرور بالاست ولی تایم‌لاین‌ها خالی‌اند | X معمولاً IPهای دیتاسنتر را مسدود می‌کند — روی سرویس RSSHub متغیر `PROXY_URI` را ست کن (مثلاً `http://user:pass@host:port` یا `socks5h://host:port`) یا از `TWITTER_THIRD_PARTY_API` استفاده کن |
 | `RSSHUB_ACCESS_KEY` ربات با سرور یکی نیست | درخواست‌ها 403 می‌گیرند؛ ربات لاگ می‌زند و تا اصلاح، به آینه‌های عمومی برمی‌گردد |
+| `rsshub.app` عمومی 403 می‌دهد یا به 404 عمومی redirect می‌شود | سرویس عمومی درخواست این deployment را نمی‌پذیرد؛ `RSSHUB_BASE_URL` را به RSSHub خودت (و `RSSHUB_ACCESS_KEY` متناظر) تغییر بده یا `X_BEARER_TOKEN` معتبر تنظیم کن |
 | سرور موقتاً خاموش است | کاری لازم نیست — ربات خودکار به آینه‌های عمومی برمی‌گردد و با برگشتن سرور، دوباره از آن استفاده می‌کند |
-| لاگ می‌گوید `Conflict: terminated by other getUpdates` | دو نمونه از ربات با یک توکن poll می‌زنند — نمونه دوم را خاموش کن: دیپلوی قبلی Railway که هنوز در حال drain است، سرویس/replica دوم از همین ریپو در Railway، یا `python twitter_telegram_bot.py` محلی که هنوز باز است |
+| لاگ می‌گوید `Conflict: terminated by other getUpdates` | وقتی `DATABASE_URL` یا `DATABASE_PUBLIC_URL` تنظیم باشد، replicaها با advisory lock اختصاصی توکن در PostgreSQL هماهنگ می‌شوند و فقط دارندهٔ lock poll می‌زند. مطمئن شو همهٔ replicaها به یک دیتابیس وصل‌اند؛ پس از به‌روزرسانی، deployment قدیمی یا سرویسی را که lock را نمی‌شناسد متوقف کن. بدون دیتابیس فقط یک replica اجرا کن؛ اگر Conflict ادامه داشت، سرویس‌های Railway و پردازش محلی `python twitter_telegram_bot.py` را بررسی کن |
 
 > ⚠️ خواندن X با کوکی اکانت، خلاف قوانین X است؛ از اکانتی استفاده کن که از دست دادنش مشکلی نداشته باشد.
 
@@ -186,6 +188,9 @@ curl "https://<آدرس-rsshub>/twitter/user/nasa?key=<ACCESS_KEY>"
 | `MIRROR_BREAKER_COOLDOWN` | `1800` | مدت کنار گذاشته‌شدن آینه شکسته (ثانیه)؛ RSSHub اختصاصی خودت هرگز کنار گذاشته نمی‌شود |
 | `MIRROR_RATE_LIMIT_COOLDOWN` | `120` | وقفه بعد از HTTP 429 (محدودیت نرخ). آینه‌ای که ما را rate-limit کرده **زنده است**، پس فقط این وقفه‌ی کوتاه را می‌گیرد (نه بنچ ۳۰ دقیقه‌ای) و در شمارش فیل‌ها حساب نمی‌شود |
 | `CHECK_INTERVAL` | `300` | فاصله بررسی (ثانیه) |
+| `BOT_POLLING_LOCK_RETRY_INTERVAL` | `10` | هر چند ثانیه replica آماده‌به‌کار دوباره برای گرفتن lock مربوط به poll تلاش کند |
+| `BOT_POLLING_LOCK_CHECK_INTERVAL` | `10` | فاصلهٔ بررسی اتصال دیتابیسِ دارندهٔ lock؛ با قطع آن، poll متوقف می‌شود |
+| `BOT_POLLING_CONFLICT_RETRY_INTERVAL` | `60` | مکث پس از گزارش وجود poller دیگر از طرف تلگرام، پیش از تلاش دوباره |
 | `REQUESTY_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY` | خالی | کلید سرویس AI برای ترجمه باکیفیت‌تر |
 | `CONCURRENT_LIMIT` | `3` | تعداد حساب‌هایی که هم‌زمان بررسی می‌شوند |
 | `RSS_FETCH_CONCURRENCY` | `12` | سقف کلی درخواست‌های هم‌زمان RSS برای جلوگیری از PoolTimeout |

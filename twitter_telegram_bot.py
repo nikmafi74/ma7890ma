@@ -61,6 +61,9 @@ X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 X_API_BASE_URL = _env_value("X_API_BASE_URL", "https://api.x.com/2").rstrip("/")
 X_USER_ID_CACHE_TTL = _env_int("X_USER_ID_CACHE_TTL", 86400, minimum=60)
 CHECK_INTERVAL = _env_int("CHECK_INTERVAL", 300, minimum=30)
+BOT_POLLING_LOCK_RETRY_INTERVAL = _env_float("BOT_POLLING_LOCK_RETRY_INTERVAL", 10, minimum=1.0)
+BOT_POLLING_LOCK_CHECK_INTERVAL = _env_float("BOT_POLLING_LOCK_CHECK_INTERVAL", 10, minimum=1.0)
+BOT_POLLING_CONFLICT_RETRY_INTERVAL = _env_float("BOT_POLLING_CONFLICT_RETRY_INTERVAL", 60, minimum=5.0)
 CONCURRENT_LIMIT = _env_int("CONCURRENT_LIMIT", 3, minimum=1)
 HTTP_MAX_CONNECTIONS = max(50, _env_int("HTTP_MAX_CONNECTIONS", 50, minimum=50))
 # Each tracked account fans out to several RSS mirrors; cap requests globally so
@@ -261,6 +264,12 @@ templates = Jinja2Templates(directory=os.path.join(BASE_PATH, "templates"))
 
 http: httpx.AsyncClient = None
 bot_app_ref = None
+telegram_runtime_state = {
+    "state": "starting",
+    "leader": False,
+    "distributed_lock": bool(db.db_url),
+    "last_started": None,
+}
 translations_cache = {}
 x_user_id_cache = {}
 translation_state = {
@@ -2001,6 +2010,195 @@ async def run_cleanup(context):
 
 # ── FastAPI + Telegram Lifecycle ──────────────────────────────────────────
 
+
+def _telegram_polling_lock_id():
+    """Stable, token-specific advisory-lock key without exposing the token."""
+    digest = hashlib.sha256(("ma7890ma:telegram-polling:" + TOKEN).encode()).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
+async def _wait_for_shutdown(stop_event, timeout):
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _wait_for_shutdown_or_conflict(stop_event, conflict_event, timeout):
+    shutdown_task = asyncio.create_task(stop_event.wait())
+    conflict_task = asyncio.create_task(conflict_event.wait())
+    done, pending = await asyncio.wait(
+        (shutdown_task, conflict_task),
+        timeout=timeout,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    if shutdown_task in done:
+        return "shutdown"
+    if conflict_task in done:
+        return "conflict"
+    return "timeout"
+
+
+async def _run_telegram_polling_coordinator(stop_event, start_bot, stop_bot):
+    """Run polling only while this process owns the shared PostgreSQL lock.
+
+    Replicas that cannot acquire it stay healthy in standby and retry, allowing a
+    replacement to take over after the active replica shuts down.
+    """
+    lock_id = _telegram_polling_lock_id()
+    database_configured = bool(getattr(db, "db_url", None))
+    if not database_configured:
+        logger.warning(
+            "DATABASE_URL is not configured; Telegram polling cannot be coordinated "
+            "across replicas. Run exactly one bot instance."
+        )
+
+    last_wait_reason = None
+    while not stop_event.is_set():
+        lock_connection = None
+        if database_configured:
+            try:
+                lock_connection = await asyncio.to_thread(
+                    db.try_acquire_advisory_lock,
+                    lock_id,
+                )
+            except Exception as exc:
+                wait_reason = f"database:{type(exc).__name__}"
+                telegram_runtime_state.update(
+                    state="waiting_for_database",
+                    leader=False,
+                    distributed_lock=True,
+                )
+                if wait_reason != last_wait_reason:
+                    logger.warning(
+                        "Cannot acquire the Telegram polling lock from PostgreSQL (%s); "
+                        "this instance will remain out of polling and retry.",
+                        type(exc).__name__,
+                    )
+                last_wait_reason = wait_reason
+                if await _wait_for_shutdown(stop_event, BOT_POLLING_LOCK_RETRY_INTERVAL):
+                    break
+                continue
+
+            if lock_connection is None:
+                telegram_runtime_state.update(
+                    state="standby",
+                    leader=False,
+                    distributed_lock=True,
+                )
+                if last_wait_reason != "lock-busy":
+                    logger.info(
+                        "Another bot instance holds the Telegram polling lock; "
+                        "this replica is in standby and will retry."
+                    )
+                last_wait_reason = "lock-busy"
+                if await _wait_for_shutdown(stop_event, BOT_POLLING_LOCK_RETRY_INTERVAL):
+                    break
+                continue
+
+        if stop_event.is_set():
+            if lock_connection is not None:
+                await asyncio.to_thread(db.release_advisory_lock, lock_connection, lock_id)
+            break
+
+        last_wait_reason = None
+        telegram_runtime_state.update(
+            state="starting",
+            leader=False,
+            distributed_lock=database_configured,
+        )
+        conflict_detected = False
+        try:
+            conflict_event = await start_bot()
+            if conflict_event is None:
+                conflict_event = asyncio.Event()
+            telegram_runtime_state.update(
+                state="polling",
+                leader=True,
+                distributed_lock=database_configured,
+                last_started=datetime.now(timezone.utc).isoformat(),
+            )
+            logger.info(
+                "Telegram polling started%s.",
+                " with the PostgreSQL advisory lock" if database_configured else " without a cross-instance lock",
+            )
+            while not stop_event.is_set():
+                wait_result = await _wait_for_shutdown_or_conflict(
+                    stop_event,
+                    conflict_event,
+                    BOT_POLLING_LOCK_CHECK_INTERVAL,
+                )
+                if wait_result == "shutdown":
+                    break
+                if wait_result == "conflict":
+                    conflict_detected = True
+                    telegram_runtime_state.update(state="external_conflict", leader=False)
+                    logger.error(
+                        "Telegram reports another getUpdates poller despite this instance's lock. "
+                        "Stopping polling; check older deployments, services, or other processes."
+                    )
+                    break
+                if lock_connection is not None:
+                    lock_alive = await asyncio.to_thread(
+                        db.advisory_lock_connection_alive,
+                        lock_connection,
+                    )
+                    if not lock_alive:
+                        telegram_runtime_state.update(state="lock_lost", leader=False)
+                        logger.error(
+                            "Lost the PostgreSQL polling-lock connection; stopping Telegram "
+                            "polling before another replica takes over."
+                        )
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            from telegram.error import Conflict
+
+            if isinstance(exc, Conflict):
+                conflict_detected = True
+                telegram_runtime_state.update(state="external_conflict", leader=False)
+                logger.error(
+                    "Telegram rejected this poll because another getUpdates poller is active; "
+                    "check older deployments, services, or other processes."
+                )
+            else:
+                telegram_runtime_state.update(state="error", leader=False)
+                logger.exception(
+                    "Telegram polling failed to start or remain active (%s).",
+                    type(exc).__name__,
+                )
+        finally:
+            try:
+                await stop_bot()
+            except Exception:
+                logger.exception("Failed to stop the Telegram application cleanly.")
+            if lock_connection is not None:
+                await asyncio.to_thread(db.release_advisory_lock, lock_connection, lock_id)
+            telegram_runtime_state["leader"] = False
+            if not stop_event.is_set():
+                telegram_runtime_state["state"] = (
+                    "external_conflict" if conflict_detected
+                    else "standby" if database_configured
+                    else "retrying"
+                )
+
+        if not stop_event.is_set():
+            retry_interval = (
+                BOT_POLLING_CONFLICT_RETRY_INTERVAL
+                if conflict_detected
+                else BOT_POLLING_LOCK_RETRY_INTERVAL
+            )
+            await _wait_for_shutdown(stop_event, retry_interval)
+
+    telegram_runtime_state.update(state="stopped", leader=False)
+
+
 @asynccontextmanager
 async def lifespan(fastapi_app):
     global http, bot_app_ref
@@ -2034,49 +2232,102 @@ async def lifespan(fastapi_app):
         ("search", "جستجو در توییت‌ها"),
         ("status", "وضعیت ربات"),
     ]
+    bot_initialized = False
+    bot_started = False
+    updater_started = False
 
-    async def post_init(application):
-        await application.bot.set_my_commands(bot_commands)
+    async def start_bot():
+        nonlocal bot_initialized, bot_started, updater_started
+        global bot_app_ref
+        bot_initialized = bot_started = updater_started = False
+        bot_app_ref = Application.builder().token(TOKEN).build()
 
-    bot_app_ref = Application.builder().token(TOKEN).post_init(post_init).build()
+        bot_app_ref.add_handler(CommandHandler("start", cmd_start))
+        bot_app_ref.add_handler(CommandHandler("help", cmd_start))
+        bot_app_ref.add_handler(CommandHandler("add", cmd_add))
+        bot_app_ref.add_handler(CommandHandler("del", cmd_del))
+        bot_app_ref.add_handler(CommandHandler("remove", cmd_del))
+        bot_app_ref.add_handler(CommandHandler("list", cmd_list))
+        bot_app_ref.add_handler(CommandHandler("test", cmd_test))
+        bot_app_ref.add_handler(CommandHandler("search", cmd_search))
+        bot_app_ref.add_handler(CommandHandler("status", cmd_status))
+        bot_app_ref.add_handler(InlineQueryHandler(handle_inline_query))
+        bot_app_ref.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    bot_app_ref.add_handler(CommandHandler("start", cmd_start))
-    bot_app_ref.add_handler(CommandHandler("help", cmd_start))
-    bot_app_ref.add_handler(CommandHandler("add", cmd_add))
-    bot_app_ref.add_handler(CommandHandler("del", cmd_del))
-    bot_app_ref.add_handler(CommandHandler("remove", cmd_del))
-    bot_app_ref.add_handler(CommandHandler("list", cmd_list))
-    bot_app_ref.add_handler(CommandHandler("test", cmd_test))
-    bot_app_ref.add_handler(CommandHandler("search", cmd_search))
-    bot_app_ref.add_handler(CommandHandler("status", cmd_status))
-    bot_app_ref.add_handler(InlineQueryHandler(handle_inline_query))
-    bot_app_ref.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+        async def handle_error(update, context):
+            from telegram.error import Conflict
+            if isinstance(context.error, Conflict):
+                return
+            logger.error("Unhandled exception: %s", context.error)
 
-    async def handle_error(update, context):
-        from telegram.error import Conflict
-        if isinstance(context.error, Conflict):
-            return
-        logger.error(f"Unhandled exception: {context.error}")
+        bot_app_ref.add_error_handler(handle_error)
 
-    bot_app_ref.add_error_handler(handle_error)
+        if db.enabled:
+            bot_app_ref.job_queue.run_repeating(check_updates, interval=CHECK_INTERVAL, first=10)
+            bot_app_ref.job_queue.run_repeating(
+                run_translation_backfill,
+                interval=max(CHECK_INTERVAL * 2, 600),
+                first=120,
+            )
+            bot_app_ref.job_queue.run_repeating(run_cleanup, interval=86400, first=300)
 
-    if db.enabled:
-        bot_app_ref.job_queue.run_repeating(check_updates, interval=CHECK_INTERVAL, first=10)
-        bot_app_ref.job_queue.run_repeating(
-            run_translation_backfill,
-            interval=max(CHECK_INTERVAL * 2, 600),
-            first=120,
+        await bot_app_ref.initialize()
+        bot_initialized = True
+        await bot_app_ref.bot.set_my_commands(bot_commands)
+        await bot_app_ref.start()
+        bot_started = True
+        polling_conflict_event = asyncio.Event()
+
+        def handle_polling_error(error):
+            from telegram.error import Conflict
+
+            if isinstance(error, Conflict):
+                polling_conflict_event.set()
+            else:
+                logger.warning("Telegram polling request failed (%s)", type(error).__name__)
+
+        # Preserve updates received while this replica was waiting for the lock.
+        await bot_app_ref.updater.start_polling(
+            drop_pending_updates=False,
+            error_callback=handle_polling_error,
         )
-        bot_app_ref.job_queue.run_repeating(run_cleanup, interval=86400, first=300)
+        updater_started = True
+        return polling_conflict_event
 
-    await bot_app_ref.initialize()
-    await bot_app_ref.start()
-    await bot_app_ref.updater.start_polling(drop_pending_updates=True)
-    yield
-    await bot_app_ref.updater.stop()
-    await bot_app_ref.stop()
-    await bot_app_ref.shutdown()
-    await http.aclose()
+    async def stop_bot():
+        nonlocal bot_initialized, bot_started, updater_started
+        global bot_app_ref
+        application = bot_app_ref
+        if application is None:
+            return
+        if updater_started and application.updater.running:
+            try:
+                await application.updater.stop()
+            except Exception:
+                logger.exception("Telegram updater shutdown failed.")
+        if bot_started and application.running:
+            try:
+                await application.stop()
+            except Exception:
+                logger.exception("Telegram application shutdown failed.")
+        if bot_initialized:
+            try:
+                await application.shutdown()
+            except Exception:
+                logger.exception("Telegram application cleanup failed.")
+        bot_app_ref = None
+        bot_initialized = bot_started = updater_started = False
+
+    stop_event = asyncio.Event()
+    coordinator_task = asyncio.create_task(
+        _run_telegram_polling_coordinator(stop_event, start_bot, stop_bot)
+    )
+    try:
+        yield
+    finally:
+        stop_event.set()
+        await coordinator_task
+        await http.aclose()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -2092,6 +2343,12 @@ def _health_payload():
         "x_api": bool(X_BEARER_TOKEN),
         "check_interval": CHECK_INTERVAL,
         "mirrors": {"total": total_mirrors, "benched": benched_mirrors},
+        "telegram": {
+            "polling_state": telegram_runtime_state["state"],
+            "polling_leader": telegram_runtime_state["leader"],
+            "distributed_lock": telegram_runtime_state["distributed_lock"],
+            "last_started": telegram_runtime_state["last_started"],
+        },
         "translation": {
             "enabled": TRANSLATE_FA,
             "mode": _translation_mode(),
