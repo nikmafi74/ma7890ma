@@ -865,6 +865,14 @@ async def translate_text(text):
     return ""
 
 
+_GENERIC_404_PATHS = {"/404", "/404.html", "/not-found", "/notfound", "/error/404"}
+
+
+def _is_generic_404_page(url):
+    """Recognize explicit generic error-page redirects, not ordinary mirror 404s."""
+    return urlparse(str(url or "")).path.rstrip("/").lower() in _GENERIC_404_PATHS
+
+
 async def _try_feed_instance(url, target_username):
     """Fetch and parse one RSS source. Return entries, [] for an empty 200, or a sentinel/error."""
     try:
@@ -878,19 +886,26 @@ async def _try_feed_instance(url, target_username):
             )
             return _RATE_LIMITED
         if resp.status_code == 404:
-            # A 404 from the original host can be account-specific. A cross-host
-            # redirect ending in 404 (for example rsshub.app -> google.com/404)
-            # means the source itself is broken, so let the circuit breaker see it.
+            # A 404 from a mirror can be account-specific even after a redirect.
+            # Explicit generic error-page paths (e.g. rsshub.app -> google.com/404)
+            # indicate the source itself is broken and should reach the breaker.
             requested_host = (urlparse(url).hostname or "").lower()
             final_host = (urlparse(str(resp.url)).hostname or "").lower()
-            if requested_host and final_host and requested_host != final_host:
+            if (
+                requested_host
+                and final_host
+                and requested_host != final_host
+                and _is_generic_404_page(resp.url)
+            ):
                 logger.debug(
-                    "Feed %s redirected from %s to %s and returned HTTP 404 (source failure)",
+                    "Feed %s redirected from %s to %s and returned a generic HTTP 404 (source failure)",
                     _safe_url_for_log(url),
                     requested_host,
                     final_host,
                 )
                 return None
+            # A redirected mirror can legitimately return 404 for a specific
+            # username. Only a known generic error-page path should bench the source.
             logger.debug(
                 "Feed %s -> %s returned HTTP 404 (account-specific miss)",
                 _safe_url_for_log(url),

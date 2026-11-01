@@ -980,6 +980,24 @@ class TestTweetBot(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(result)
 
+    async def test_cross_host_mirror_404_does_not_bench_aggregator(self):
+        """Nitter.cz redirects to per-user mirrors; their 404 must not bench the router."""
+        client = MagicMock()
+        client.get = AsyncMock(return_value=MagicMock(
+            status_code=404,
+            url="https://nitter.kareem.one/user/rss",
+        ))
+        source = "https://nitter.cz/{username}/rss"
+        with (
+            patch("twitter_telegram_bot.RSS_SOURCES", [source]),
+            patch("twitter_telegram_bot.X_BEARER_TOKEN", ""),
+            patch("twitter_telegram_bot.http", client),
+        ):
+            entries = await fetch_feed("user")
+
+        self.assertEqual(entries, [])
+        self.assertEqual(mirror_health["nitter.cz"], {"fails": 0, "tripped_until": 0.0})
+
     async def test_account_404_does_not_bench_the_mirror_for_other_users(self):
         """A 404 may be user-specific and must not mark the whole mirror dead."""
         calls = []
